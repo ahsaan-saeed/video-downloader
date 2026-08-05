@@ -25,119 +25,173 @@ export async function POST(req: NextRequest) {
 
     const cleanUrl = url.trim();
 
-    // 1. YouTube extraction using native Next.js Node.js @distube/ytdl-core
+    // 1. YouTube Multi-Source Hybrid Engine
     if (platform === 'youtube') {
-      try {
-        const ytData = await extractYouTubeNative(cleanUrl);
-        if (ytData) return NextResponse.json(ytData);
-      } catch (err: any) {
-        console.warn('Native ytdl-core failed, attempting fallback API:', err?.message);
+      const ytResult = await extractYouTubeHybrid(cleanUrl);
+      if (ytResult && ytResult.qualities.length > 0) {
+        return NextResponse.json(ytResult);
       }
     }
 
-    // 2. Facebook extraction
+    // 2. Facebook Direct Scraper
     if (platform === 'facebook') {
-      const fbData = await extractFacebookLive(cleanUrl);
-      if (fbData) return NextResponse.json(fbData);
+      const fbResult = await extractFacebookDirect(cleanUrl);
+      if (fbResult && fbResult.qualities.length > 0) {
+        return NextResponse.json(fbResult);
+      }
     }
 
-    // 3. Instagram extraction
+    // 3. Instagram Direct Scraper
     if (platform === 'instagram') {
-      const igData = await extractInstagramLive(cleanUrl);
-      if (igData) return NextResponse.json(igData);
+      const igResult = await extractInstagramDirect(cleanUrl);
+      if (igResult && igResult.qualities.length > 0) {
+        return NextResponse.json(igResult);
+      }
     }
 
-    // 4. Cobalt API Backup
-    const cobaltData = await extractCobalt(cleanUrl, platform);
-    if (cobaltData) return NextResponse.json(cobaltData);
+    // 4. Backup Cobalt Instance Engine
+    const cobaltResult = await extractCobalt(cleanUrl, platform);
+    if (cobaltResult && cobaltResult.qualities.length > 0) {
+      return NextResponse.json(cobaltResult);
+    }
 
     return NextResponse.json(
-      { error: `Could not fetch live stream for this ${platform} video. Please verify the URL and try again.` },
+      { error: `Unable to extract download links for this ${platform} video. Please check that the post is public.` },
       { status: 422 }
     );
 
   } catch (error) {
     console.error('Fetch video API error:', error);
     return NextResponse.json(
-      { error: 'Failed to process video URL. Please check the link and try again.' },
+      { error: 'Failed to process video URL. Please try again.' },
       { status: 500 }
     );
   }
 }
 
 // ---------------------------------------------------------------------------
-// NATIVE YOUTUBE EXTRACTOR (@distube/ytdl-core)
+// HYBRID YOUTUBE EXTRACTOR (ytdl-core metadata + Piped/Invidious stream links)
 // ---------------------------------------------------------------------------
-async function extractYouTubeNative(url: string): Promise<VideoInfo | null> {
-  if (!ytdl.validateURL(url)) return null;
+async function extractYouTubeHybrid(url: string): Promise<VideoInfo | null> {
+  const videoId = extractYouTubeId(url);
+  if (!videoId) return null;
 
-  const info = await ytdl.getInfo(url);
-  if (!info || !info.videoDetails) return null;
-
-  const details = info.videoDetails;
-  const title = details.title;
-  const author = details.author?.name || 'YouTube Channel';
-  const durationSec = parseInt(details.lengthSeconds || '0', 10);
-  const duration = formatSeconds(durationSec);
-
-  // Highest resolution thumbnail
-  const thumbnails = details.thumbnails || [];
-  const thumbnail = thumbnails.length > 0 
-    ? thumbnails[thumbnails.length - 1].url 
-    : `https://i.ytimg.com/vi/${details.videoId}/hqdefault.jpg`;
-
+  let title = 'YouTube Video';
+  let author = 'YouTube Creator';
+  let durationSec = 0;
+  let thumbnail = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
   const qualities: VideoQuality[] = [];
 
-  // Filter video & audio formats
-  const formats = info.formats || [];
+  // Step A: Extract Metadata using @distube/ytdl-core
+  try {
+    if (ytdl.validateURL(url)) {
+      const info = await ytdl.getInfo(url);
+      if (info && info.videoDetails) {
+        title = info.videoDetails.title || title;
+        author = info.videoDetails.author?.name || author;
+        durationSec = parseInt(info.videoDetails.lengthSeconds || '0', 10);
+        const thumbs = info.videoDetails.thumbnails || [];
+        if (thumbs.length > 0) thumbnail = thumbs[thumbs.length - 1].url;
 
-  // 1080p, 720p, 480p, 360p combined / video formats
-  const videoFormats = formats.filter(f => f.hasVideo && f.url);
-  const audioFormats = formats.filter(f => f.hasAudio && !f.hasVideo && f.url);
-
-  // Add video qualities
-  const seenQualities = new Set<string>();
-
-  videoFormats.forEach((fmt, idx) => {
-    const qualLabel = fmt.qualityLabel || (fmt.height ? `${fmt.height}p` : '720p');
-    if (!seenQualities.has(qualLabel)) {
-      seenQualities.add(qualLabel);
-
-      const bytes = fmt.contentLength ? parseInt(fmt.contentLength, 10) : 0;
-      const sizeMB = bytes > 0 
-        ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` 
-        : calculateBitrateSize(qualLabel, durationSec);
-
-      qualities.push({
-        id: `yt-native-${idx}`,
-        label: `${qualLabel} HD`,
-        quality: qualLabel,
-        format: (fmt.container || 'mp4').toLowerCase(),
-        downloadUrl: fmt.url,
-        fileSize: sizeMB,
-        resolution: fmt.width && fmt.height ? `${fmt.width}x${fmt.height}` : getResolutionDimensions(qualLabel),
-      });
+        // Collect any direct formats ytdl-core decrypted
+        (info.formats || []).forEach((fmt, idx) => {
+          if (fmt.url && (fmt.hasVideo || fmt.hasAudio)) {
+            const qual = fmt.qualityLabel || (fmt.height ? `${fmt.height}p` : '360p');
+            qualities.push({
+              id: `ytdl-${idx}`,
+              label: `${qual} HD`,
+              quality: qual,
+              format: (fmt.container || 'mp4').toLowerCase(),
+              downloadUrl: fmt.url,
+              fileSize: calculateBitrateSize(qual, durationSec),
+              resolution: fmt.width && fmt.height ? `${fmt.width}x${fmt.height}` : getResolutionDimensions(qual),
+            });
+          }
+        });
+      }
     }
-  });
-
-  // Add Audio MP3 Quality
-  if (audioFormats.length > 0) {
-    const bestAudio = audioFormats[0];
-    const bytes = bestAudio.contentLength ? parseInt(bestAudio.contentLength, 10) : 0;
-    const audioSizeMB = bytes > 0
-      ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-      : calculateBitrateSize('audio', durationSec);
-
-    qualities.push({
-      id: 'yt-native-audio-mp3',
-      label: 'Audio Only (MP3)',
-      quality: 'audio',
-      format: 'mp3',
-      downloadUrl: bestAudio.url,
-      fileSize: audioSizeMB,
-      isAudioOnly: true,
-    });
+  } catch {
+    // If ytdl-core throws decipher warning, fallback to oEmbed + Piped
   }
+
+  // Step B: Query Piped API Nodes for 1080p, 720p, 480p, and MP3 streams
+  const pipedEndpoints = [
+    `https://pipedapi.kavin.rocks/streams/${videoId}`,
+    `https://pipedapi.respecialized.com/streams/${videoId}`,
+    `https://pipedapi.tokhmi.xyz/streams/${videoId}`,
+  ];
+
+  for (const ep of pipedEndpoints) {
+    try {
+      const res = await fetch(ep, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(4000),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data) {
+          title = data.title || title;
+          author = data.uploader || author;
+          if (data.duration > 0) durationSec = data.duration;
+          if (data.thumbnailUrl) thumbnail = data.thumbnailUrl;
+
+          // Process Video Streams
+          if (Array.isArray(data.videoStreams)) {
+            data.videoStreams.forEach((stream: any, idx: number) => {
+              if (stream.url) {
+                const resLabel = stream.quality || `${stream.height || 720}p`;
+                qualities.push({
+                  id: `piped-${idx}`,
+                  label: `${resLabel} (${stream.format || 'MP4'})`,
+                  quality: resLabel,
+                  format: (stream.format || 'mp4').toLowerCase(),
+                  downloadUrl: stream.url,
+                  fileSize: calculateBitrateSize(resLabel, durationSec),
+                  resolution: `${stream.width || 1280}x${stream.height || 720}`,
+                });
+              }
+            });
+          }
+
+          // Process Audio Stream (MP3)
+          if (Array.isArray(data.audioStreams) && data.audioStreams.length > 0) {
+            const audio = data.audioStreams[0];
+            qualities.push({
+              id: 'piped-audio-mp3',
+              label: 'Audio Only (MP3)',
+              quality: 'audio',
+              format: 'mp3',
+              downloadUrl: audio.url,
+              fileSize: calculateBitrateSize('audio', durationSec),
+              isAudioOnly: true,
+            });
+          }
+
+          break; // Stop at first successful piped node
+        }
+      }
+    } catch {
+      // Try next node
+    }
+  }
+
+  // Step C: Fallback to YouTube oEmbed if title still default
+  if (title === 'YouTube Video') {
+    try {
+      const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+      if (oembedRes.ok) {
+        const data = await oembedRes.json();
+        title = data.title || title;
+        author = data.author_name || author;
+        thumbnail = data.thumbnail_url || thumbnail;
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  const duration = formatSeconds(durationSec);
 
   if (qualities.length > 0) {
     return {
@@ -147,7 +201,7 @@ async function extractYouTubeNative(url: string): Promise<VideoInfo | null> {
       author,
       platform: 'youtube',
       originalUrl: url,
-      qualities,
+      qualities: deduplicateQualities(qualities),
     };
   }
 
@@ -155,13 +209,13 @@ async function extractYouTubeNative(url: string): Promise<VideoInfo | null> {
 }
 
 // ---------------------------------------------------------------------------
-// FACEBOOK EXTRACTOR
+// FACEBOOK DIRECT EXTRACTOR
 // ---------------------------------------------------------------------------
-async function extractFacebookLive(url: string): Promise<VideoInfo | null> {
+async function extractFacebookDirect(url: string): Promise<VideoInfo | null> {
   try {
     const res = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       },
       signal: AbortSignal.timeout(5000),
     });
@@ -183,7 +237,7 @@ async function extractFacebookLive(url: string): Promise<VideoInfo | null> {
             quality: '1080p',
             format: 'mp4',
             downloadUrl: cleanEscapedUrl(hdMatch[1]),
-            fileSize: '45.2 MB',
+            fileSize: '42.5 MB',
             resolution: '1920x1080',
           });
         }
@@ -194,7 +248,7 @@ async function extractFacebookLive(url: string): Promise<VideoInfo | null> {
             quality: '720p',
             format: 'mp4',
             downloadUrl: cleanEscapedUrl(sdMatch[1]),
-            fileSize: '22.6 MB',
+            fileSize: '21.2 MB',
             resolution: '1280x720',
           });
         }
@@ -202,7 +256,7 @@ async function extractFacebookLive(url: string): Promise<VideoInfo | null> {
         return {
           title: titleMatch ? decodeHtmlEntities(titleMatch[1]) : 'Facebook Video',
           thumbnail: thumbMatch ? decodeHtmlEntities(thumbMatch[1]) : 'https://images.unsplash.com/photo-1563986768609-322da13575f3?q=80&w=800&auto=format&fit=crop',
-          duration: 'FB Video',
+          duration: 'FB Reel',
           author: 'Facebook Creator',
           platform: 'facebook',
           originalUrl: url,
@@ -218,9 +272,9 @@ async function extractFacebookLive(url: string): Promise<VideoInfo | null> {
 }
 
 // ---------------------------------------------------------------------------
-// INSTAGRAM EXTRACTOR
+// INSTAGRAM DIRECT EXTRACTOR
 // ---------------------------------------------------------------------------
-async function extractInstagramLive(url: string): Promise<VideoInfo | null> {
+async function extractInstagramDirect(url: string): Promise<VideoInfo | null> {
   try {
     const res = await fetch(url, {
       headers: {
@@ -252,7 +306,7 @@ async function extractInstagramLive(url: string): Promise<VideoInfo | null> {
               quality: '1080p',
               format: 'mp4',
               downloadUrl: videoUrl,
-              fileSize: '34.8 MB',
+              fileSize: '32.4 MB',
               resolution: '1080x1920',
             },
             {
@@ -261,7 +315,7 @@ async function extractInstagramLive(url: string): Promise<VideoInfo | null> {
               quality: 'audio',
               format: 'mp3',
               downloadUrl: videoUrl,
-              fileSize: '4.2 MB',
+              fileSize: '3.8 MB',
               isAudioOnly: true,
             },
           ],
@@ -294,7 +348,7 @@ async function extractCobalt(url: string, platform: 'youtube' | 'facebook' | 'in
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         },
         body: JSON.stringify({ url, vQuality: '1080' }),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(5000),
       });
 
       if (res.ok) {
@@ -338,21 +392,37 @@ async function extractCobalt(url: string, platform: 'youtube' | 'facebook' | 'in
 }
 
 // ---------------------------------------------------------------------------
-// UTILITY FUNCTIONS
+// UTILITY HELPERS
 // ---------------------------------------------------------------------------
 function calculateBitrateSize(qualityStr: string, durationSec: number): string {
-  if (durationSec <= 0) return 'Variable MB';
+  if (durationSec <= 0) return 'Stream MB';
 
   let bitrateBps = 2500000;
   if (qualityStr.includes('2160') || qualityStr.includes('4K')) bitrateBps = 12000000;
   else if (qualityStr.includes('1080')) bitrateBps = 5500000;
   else if (qualityStr.includes('720')) bitrateBps = 2800000;
   else if (qualityStr.includes('480')) bitrateBps = 1400000;
+  else if (qualityStr.includes('360')) bitrateBps = 800000;
   else if (qualityStr.includes('audio') || qualityStr.includes('mp3')) bitrateBps = 256000;
 
   const totalBytes = (bitrateBps * durationSec) / 8;
   const totalMB = totalBytes / (1024 * 1024);
   return `${totalMB.toFixed(1)} MB`;
+}
+
+function deduplicateQualities(qualities: VideoQuality[]): VideoQuality[] {
+  const seen = new Set<string>();
+  return qualities.filter(q => {
+    const key = `${q.quality}-${q.format}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function extractYouTubeId(url: string): string | null {
+  const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/);
+  return match ? match[1] : null;
 }
 
 function getResolutionDimensions(qualityStr: string): string {

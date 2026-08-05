@@ -38,9 +38,10 @@ export function useDownload() {
         signal: abortControllerRef.current.signal,
       });
 
+      const fileName = `${sanitizeFileName(videoTitle)}_${quality.quality}.${quality.format}`;
+
       if (!response.ok) {
-        // Fallback: direct window download trigger if CORS blocks streaming
-        triggerDirectBrowserDownload(quality.downloadUrl, videoTitle, quality.format);
+        await saveFileWithNativePickerOrLink(null, quality.downloadUrl, fileName, quality);
         setDownloadState({
           status: 'completed',
           progress: 100,
@@ -54,16 +55,16 @@ export function useDownload() {
       }
 
       const contentLength = response.headers.get('Content-Length');
-      const totalBytes = contentLength ? parseInt(contentLength, 10) : 35 * 1024 * 1024; // Default estimate if header absent
+      const totalBytes = contentLength ? parseInt(contentLength, 10) : 25 * 1024 * 1024;
 
       const reader = response.body?.getReader();
       if (!reader) {
-        triggerDirectBrowserDownload(quality.downloadUrl, videoTitle, quality.format);
+        await saveFileWithNativePickerOrLink(null, quality.downloadUrl, fileName, quality);
         setDownloadState({
           status: 'completed',
           progress: 100,
           downloadedBytes: totalBytes,
-          totalBytes: totalBytes,
+          totalBytes,
           speed: 'Direct',
           eta: '00:00',
         });
@@ -85,8 +86,8 @@ export function useDownload() {
           const now = Date.now();
           const timeDiffSec = (now - lastTime) / 1000;
 
-          let speedStr = '2.5 MB/s';
-          let etaStr = '00:05';
+          let speedStr = '3.5 MB/s';
+          let etaStr = '00:03';
 
           if (timeDiffSec >= 0.3) {
             const bytesDiff = receivedLength - lastBytes;
@@ -117,27 +118,20 @@ export function useDownload() {
         }
       }
 
-      // Combine chunks into Blob and save
+      // Combine chunks into Blob
       const blob = new Blob(chunks, {
         type: quality.isAudioOnly ? 'audio/mp3' : 'video/mp4',
       });
-      const blobUrl = URL.createObjectURL(blob);
 
-      const fileName = `${sanitizeFileName(videoTitle)}_${quality.quality}.${quality.format}`;
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = fileName;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(blobUrl);
+      // Trigger Native OS "Save As..." File Picker Dialog Popup
+      await saveFileWithNativePickerOrLink(blob, quality.downloadUrl, fileName, quality);
 
       setDownloadState({
         status: 'completed',
         progress: 100,
         downloadedBytes: totalBytes,
         totalBytes,
-        speed: 'Finished',
+        speed: 'Saved',
         eta: '00:00',
       });
 
@@ -155,14 +149,15 @@ export function useDownload() {
         return;
       }
 
-      // Fallback direct download
-      triggerDirectBrowserDownload(quality.downloadUrl, videoTitle, quality.format);
+      const fileName = `${sanitizeFileName(videoTitle)}_${quality.quality}.${quality.format}`;
+      await saveFileWithNativePickerOrLink(null, quality.downloadUrl, fileName, quality);
+
       setDownloadState({
         status: 'completed',
         progress: 100,
         downloadedBytes: 100,
         totalBytes: 100,
-        speed: 'Direct CDN',
+        speed: 'Direct',
         eta: '00:00',
       });
       fireConfetti();
@@ -194,12 +189,54 @@ export function useDownload() {
   };
 }
 
-function triggerDirectBrowserDownload(url: string, title: string, format: string) {
+async function saveFileWithNativePickerOrLink(
+  blob: Blob | null,
+  directUrl: string,
+  fileName: string,
+  quality: VideoQuality
+) {
+  // 1. Try Native OS "Save As..." File Dialog Popup (File System Access API)
+  if (blob && typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
+    try {
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName: fileName,
+        types: [
+          {
+            description: quality.isAudioOnly ? 'MP3 Audio File' : 'MP4 Video File',
+            accept: quality.isAudioOnly
+              ? { 'audio/mp3': ['.mp3'] }
+              : { 'video/mp4': ['.mp4'] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (err: any) {
+      if (err.name === 'AbortError') return; // User closed dialog
+    }
+  }
+
+  // 2. Fallback: Trigger Blob Anchor Download
+  if (blob) {
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    return;
+  }
+
+  // 3. Direct URL fallback anchor
   const link = document.createElement('a');
-  link.href = url;
+  link.href = directUrl;
+  link.download = fileName;
   link.target = '_blank';
   link.rel = 'noopener noreferrer';
-  link.download = `${sanitizeFileName(title)}.${format}`;
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);

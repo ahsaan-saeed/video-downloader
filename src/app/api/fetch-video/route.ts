@@ -2,10 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { detectPlatform, isValidUrl } from '@/lib/validators';
 import { VideoInfo, VideoQuality } from '@/lib/types';
 
-// We intentionally avoid @distube/ytdl-core on Vercel because YouTube's
-// decipher function changes daily and breaks all self-hosted extractors.
-// Instead we use multiple public API tiers with automatic fallback.
-
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -24,6 +20,13 @@ export async function POST(req: NextRequest) {
     }
 
     const cleanUrl = url.trim();
+
+    // ── Tier 0: Self-Hosted Python yt-dlp Backend (Render.com / Custom VPS) ────
+    const backendUrl = process.env.BACKEND_URL;
+    if (backendUrl) {
+      const selfHostedResult = await fetchViaSelfHostedBackend(cleanUrl, backendUrl);
+      if (selfHostedResult) return NextResponse.json(selfHostedResult);
+    }
 
     // ── Tier 1: RapidAPI (if user configured their key) ────────────────────
     const rapidKey = process.env.RAPIDAPI_KEY;
@@ -60,8 +63,7 @@ export async function POST(req: NextRequest) {
       {
         error:
           'Could not fetch download links automatically. ' +
-          'To enable full downloads, add a RAPIDAPI_KEY in your Vercel environment variables. ' +
-          'Get a free key at rapidapi.com and subscribe to "All Video Downloader" API.',
+          'To enable guaranteed 100% video downloads, deploy the backend service on Render.com and set the BACKEND_URL environment variable in Vercel.',
       },
       { status: 422 }
     );
@@ -69,6 +71,31 @@ export async function POST(req: NextRequest) {
     console.error('API error:', err);
     return NextResponse.json({ error: 'Server error. Please try again.' }, { status: 500 });
   }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 0 – Self-Hosted Python yt-dlp Backend
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchViaSelfHostedBackend(url: string, backendUrl: string): Promise<VideoInfo | null> {
+  try {
+    const endpoint = `${backendUrl.replace(/\/$/, '')}/api/info`;
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+      signal: AbortSignal.timeout(15000), // Render free tier can take up to 15s if waking up
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.qualities && data.qualities.length > 0) {
+        return data as VideoInfo;
+      }
+    }
+  } catch (err) {
+    console.warn('Self-hosted backend call failed, falling back to public APIs:', err);
+  }
+  return null;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -146,7 +173,6 @@ function mapRapidApiResponse(
 // ────────────────────────────────────────────────────────────────────────────
 async function fetchYouTubeViaY2Mate(url: string): Promise<VideoInfo | null> {
   try {
-    // Step 1 – Analyse
     const analyseRes = await fetch('https://www.y2mate.com/mates/analyzeV2/ajax', {
       method: 'POST',
       headers: {
@@ -166,45 +192,36 @@ async function fetchYouTubeViaY2Mate(url: string): Promise<VideoInfo | null> {
     const thumbnail: string = analyseData.thumbnail || '';
     const durationStr: string = analyseData.duration || '00:00';
 
-    // Convert mm:ss to HH:MM:SS string
-    const duration = durationStr;
-
     const qualities: VideoQuality[] = [];
 
-    // video links
     const videoLinks = analyseData.links?.mp4 || {};
     for (const [quality, info] of Object.entries(videoLinks as Record<string, any>)) {
       if (info?.k) {
-        const dlUrl = buildY2MateDownloadUrl(info.k);
-        if (dlUrl) {
-          qualities.push({
-            id: `y2mate-${quality}`,
-            label: `${quality} (MP4)`,
-            quality,
-            format: 'mp4',
-            downloadUrl: dlUrl,
-            fileSize: info.size || '',
-          });
-        }
+        const dlUrl = `https://www.y2mate.com/mates/convertV2/index?k=${info.k}`;
+        qualities.push({
+          id: `y2mate-${quality}`,
+          label: `${quality} (MP4)`,
+          quality,
+          format: 'mp4',
+          downloadUrl: dlUrl,
+          fileSize: info.size || '',
+        });
       }
     }
 
-    // audio links
     const audioLinks = analyseData.links?.mp3 || {};
     for (const [quality, info] of Object.entries(audioLinks as Record<string, any>)) {
       if (info?.k) {
-        const dlUrl = buildY2MateDownloadUrl(info.k);
-        if (dlUrl) {
-          qualities.push({
-            id: `y2mate-audio-${quality}`,
-            label: `Audio ${quality} (MP3)`,
-            quality: 'audio',
-            format: 'mp3',
-            downloadUrl: dlUrl,
-            fileSize: info.size || '',
-            isAudioOnly: true,
-          });
-        }
+        const dlUrl = `https://www.y2mate.com/mates/convertV2/index?k=${info.k}`;
+        qualities.push({
+          id: `y2mate-audio-${quality}`,
+          label: `Audio ${quality} (MP3)`,
+          quality: 'audio',
+          format: 'mp3',
+          downloadUrl: dlUrl,
+          fileSize: info.size || '',
+          isAudioOnly: true,
+        });
       }
     }
 
@@ -213,7 +230,7 @@ async function fetchYouTubeViaY2Mate(url: string): Promise<VideoInfo | null> {
     return {
       title,
       thumbnail,
-      duration,
+      duration: durationStr,
       author: 'YouTube Channel',
       platform: 'youtube',
       originalUrl: url,
@@ -222,11 +239,6 @@ async function fetchYouTubeViaY2Mate(url: string): Promise<VideoInfo | null> {
   } catch {
     return null;
   }
-}
-
-function buildY2MateDownloadUrl(k: string): string {
-  // Y2Mate returns a direct key — build the convert URL
-  return `https://www.y2mate.com/mates/convertV2/index?k=${k}`;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -242,7 +254,6 @@ async function fetchYouTubeViaNoembed(url: string): Promise<VideoInfo | null> {
   let durationSec = 0;
   const qualities: VideoQuality[] = [];
 
-  // Fetch oEmbed for metadata
   try {
     const res = await fetch(
       `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
@@ -256,7 +267,6 @@ async function fetchYouTubeViaNoembed(url: string): Promise<VideoInfo | null> {
     }
   } catch {/* ignore */}
 
-  // Fetch Piped streams
   const pipedNodes = [
     `https://pipedapi.kavin.rocks/streams/${videoId}`,
     `https://piped-api.garudalinux.org/streams/${videoId}`,

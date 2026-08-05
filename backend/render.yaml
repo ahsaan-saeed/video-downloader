@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: video-downloader-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    rootDir: backend
+    plan: free
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /

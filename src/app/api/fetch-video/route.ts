@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import ytdl from '@distube/ytdl-core';
 import { detectPlatform, isValidUrl } from '@/lib/validators';
 import { VideoInfo, VideoQuality } from '@/lib/types';
 
@@ -24,25 +25,34 @@ export async function POST(req: NextRequest) {
 
     const cleanUrl = url.trim();
 
-    // 1. YouTube Live Extraction
+    // 1. YouTube extraction using native Next.js Node.js @distube/ytdl-core
     if (platform === 'youtube') {
-      const ytData = await extractRealYouTube(cleanUrl);
-      if (ytData) return NextResponse.json(ytData);
-    } else if (platform === 'facebook') {
-      const fbData = await extractRealFacebook(cleanUrl);
+      try {
+        const ytData = await extractYouTubeNative(cleanUrl);
+        if (ytData) return NextResponse.json(ytData);
+      } catch (err: any) {
+        console.warn('Native ytdl-core failed, attempting fallback API:', err?.message);
+      }
+    }
+
+    // 2. Facebook extraction
+    if (platform === 'facebook') {
+      const fbData = await extractFacebookLive(cleanUrl);
       if (fbData) return NextResponse.json(fbData);
-    } else if (platform === 'instagram') {
-      const igData = await extractRealInstagram(cleanUrl);
+    }
+
+    // 3. Instagram extraction
+    if (platform === 'instagram') {
+      const igData = await extractInstagramLive(cleanUrl);
       if (igData) return NextResponse.json(igData);
     }
 
-    // 2. Backup Cobalt API
+    // 4. Cobalt API Backup
     const cobaltData = await extractCobalt(cleanUrl, platform);
     if (cobaltData) return NextResponse.json(cobaltData);
 
-    // If real extraction failed, return explicit error instead of hardcoded 3-minute fallback
     return NextResponse.json(
-      { error: `Could not fetch live stream for this ${platform} video. Please ensure the link is public and accessible.` },
+      { error: `Could not fetch live stream for this ${platform} video. Please verify the URL and try again.` },
       { status: 422 }
     );
 
@@ -56,174 +66,102 @@ export async function POST(req: NextRequest) {
 }
 
 // ---------------------------------------------------------------------------
-// REAL YOUTUBE EXTRACTOR (Piped API + Invidious + oEmbed)
+// NATIVE YOUTUBE EXTRACTOR (@distube/ytdl-core)
 // ---------------------------------------------------------------------------
-async function extractRealYouTube(url: string): Promise<VideoInfo | null> {
-  const videoId = extractYouTubeId(url);
-  if (!videoId) return null;
+async function extractYouTubeNative(url: string): Promise<VideoInfo | null> {
+  if (!ytdl.validateURL(url)) return null;
 
-  // 1. Try Piped API Instances (returns exact duration & direct video stream URLs)
-  const pipedInstances = [
-    `https://pipedapi.kavin.rocks/streams/${videoId}`,
-    `https://pipedapi.respecialized.com/streams/${videoId}`,
-    `https://pipedapi.tokhmi.xyz/streams/${videoId}`,
-  ];
+  const info = await ytdl.getInfo(url);
+  if (!info || !info.videoDetails) return null;
 
-  for (const endpoint of pipedInstances) {
-    try {
-      const res = await fetch(endpoint, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(5000),
+  const details = info.videoDetails;
+  const title = details.title;
+  const author = details.author?.name || 'YouTube Channel';
+  const durationSec = parseInt(details.lengthSeconds || '0', 10);
+  const duration = formatSeconds(durationSec);
+
+  // Highest resolution thumbnail
+  const thumbnails = details.thumbnails || [];
+  const thumbnail = thumbnails.length > 0 
+    ? thumbnails[thumbnails.length - 1].url 
+    : `https://i.ytimg.com/vi/${details.videoId}/hqdefault.jpg`;
+
+  const qualities: VideoQuality[] = [];
+
+  // Filter video & audio formats
+  const formats = info.formats || [];
+
+  // 1080p, 720p, 480p, 360p combined / video formats
+  const videoFormats = formats.filter(f => f.hasVideo && f.url);
+  const audioFormats = formats.filter(f => f.hasAudio && !f.hasVideo && f.url);
+
+  // Add video qualities
+  const seenQualities = new Set<string>();
+
+  videoFormats.forEach((fmt, idx) => {
+    const qualLabel = fmt.qualityLabel || (fmt.height ? `${fmt.height}p` : '720p');
+    if (!seenQualities.has(qualLabel)) {
+      seenQualities.add(qualLabel);
+
+      const bytes = fmt.contentLength ? parseInt(fmt.contentLength, 10) : 0;
+      const sizeMB = bytes > 0 
+        ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` 
+        : calculateBitrateSize(qualLabel, durationSec);
+
+      qualities.push({
+        id: `yt-native-${idx}`,
+        label: `${qualLabel} HD`,
+        quality: qualLabel,
+        format: (fmt.container || 'mp4').toLowerCase(),
+        downloadUrl: fmt.url,
+        fileSize: sizeMB,
+        resolution: fmt.width && fmt.height ? `${fmt.width}x${fmt.height}` : getResolutionDimensions(qualLabel),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data && data.title && Array.isArray(data.videoStreams)) {
-          const title = data.title;
-          const author = data.uploader || 'YouTube Channel';
-          const durationSec = data.duration || 0;
-          const duration = formatSeconds(durationSec);
-          const thumbnail = data.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
-
-          const qualities: VideoQuality[] = [];
-
-          // Process Video Streams
-          data.videoStreams.forEach((stream: any, idx: number) => {
-            if (stream.url && stream.quality) {
-              const resLabel = stream.quality || `${stream.height || 720}p`;
-              const fileSizeMB = calculateBitrateSize(resLabel, durationSec);
-
-              qualities.push({
-                id: `piped-v-${idx}`,
-                label: `${resLabel} (${stream.format || 'MP4'})`,
-                quality: resLabel,
-                format: (stream.format || 'mp4').toLowerCase(),
-                downloadUrl: stream.url,
-                fileSize: fileSizeMB,
-                resolution: `${stream.width || 1280}x${stream.height || 720}`,
-              });
-            }
-          });
-
-          // Process Audio Streams
-          if (Array.isArray(data.audioStreams) && data.audioStreams.length > 0) {
-            const bestAudio = data.audioStreams[0];
-            const audioSize = calculateBitrateSize('audio', durationSec);
-            qualities.push({
-              id: 'piped-audio-mp3',
-              label: 'Audio Only (MP3)',
-              quality: 'audio',
-              format: 'mp3',
-              downloadUrl: bestAudio.url,
-              fileSize: audioSize,
-              isAudioOnly: true,
-            });
-          }
-
-          if (qualities.length > 0) {
-            return {
-              title,
-              thumbnail,
-              duration,
-              author,
-              platform: 'youtube',
-              originalUrl: url,
-              qualities: deduplicateQualities(qualities),
-            };
-          }
-        }
-      }
-    } catch {
-      // Try next piped instance
     }
+  });
+
+  // Add Audio MP3 Quality
+  if (audioFormats.length > 0) {
+    const bestAudio = audioFormats[0];
+    const bytes = bestAudio.contentLength ? parseInt(bestAudio.contentLength, 10) : 0;
+    const audioSizeMB = bytes > 0
+      ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+      : calculateBitrateSize('audio', durationSec);
+
+    qualities.push({
+      id: 'yt-native-audio-mp3',
+      label: 'Audio Only (MP3)',
+      quality: 'audio',
+      format: 'mp3',
+      downloadUrl: bestAudio.url,
+      fileSize: audioSizeMB,
+      isAudioOnly: true,
+    });
   }
 
-  // 2. Try Invidious Nodes Fallback
-  const invidiousNodes = [
-    `https://inv.tux.pizza/api/v1/videos/${videoId}`,
-    `https://invidious.nerdvpn.de/api/v1/videos/${videoId}`,
-    `https://yewtu.be/api/v1/videos/${videoId}`,
-  ];
-
-  for (const node of invidiousNodes) {
-    try {
-      const res = await fetch(node, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(5000),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data && data.title) {
-          const title = data.title;
-          const author = data.author || 'YouTube Channel';
-          const durationSec = data.lengthSeconds || 0;
-          const duration = formatSeconds(durationSec);
-          const thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-
-          const qualities: VideoQuality[] = [];
-
-          if (Array.isArray(data.formatStreams)) {
-            data.formatStreams.forEach((fmt: any, idx: number) => {
-              if (fmt.url) {
-                const resLabel = fmt.qualityLabel || fmt.resolution || '720p';
-                qualities.push({
-                  id: `inv-${idx}`,
-                  label: `${resLabel} HD`,
-                  quality: resLabel,
-                  format: 'mp4',
-                  downloadUrl: fmt.url,
-                  fileSize: fmt.size ? `${(fmt.size / (1024 * 1024)).toFixed(1)} MB` : calculateBitrateSize(resLabel, durationSec),
-                  resolution: fmt.resolution,
-                });
-              }
-            });
-          }
-
-          if (Array.isArray(data.adaptiveFormats)) {
-            const audioStream = data.adaptiveFormats.find((f: any) => f.type?.includes('audio'));
-            if (audioStream && audioStream.url) {
-              qualities.push({
-                id: 'inv-audio-mp3',
-                label: 'Audio Only (MP3)',
-                quality: 'audio',
-                format: 'mp3',
-                downloadUrl: audioStream.url,
-                fileSize: calculateBitrateSize('audio', durationSec),
-                isAudioOnly: true,
-              });
-            }
-          }
-
-          if (qualities.length > 0) {
-            return {
-              title,
-              thumbnail,
-              duration,
-              author,
-              platform: 'youtube',
-              originalUrl: url,
-              qualities: deduplicateQualities(qualities),
-            };
-          }
-        }
-      }
-    } catch {
-      // Try next invidious node
-    }
+  if (qualities.length > 0) {
+    return {
+      title,
+      thumbnail,
+      duration,
+      author,
+      platform: 'youtube',
+      originalUrl: url,
+      qualities,
+    };
   }
 
   return null;
 }
 
 // ---------------------------------------------------------------------------
-// REAL FACEBOOK EXTRACTOR
+// FACEBOOK EXTRACTOR
 // ---------------------------------------------------------------------------
-async function extractRealFacebook(url: string): Promise<VideoInfo | null> {
+async function extractFacebookLive(url: string): Promise<VideoInfo | null> {
   try {
     const res = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       },
       signal: AbortSignal.timeout(5000),
     });
@@ -240,7 +178,7 @@ async function extractRealFacebook(url: string): Promise<VideoInfo | null> {
         const qualities: VideoQuality[] = [];
         if (hdMatch) {
           qualities.push({
-            id: 'fb-hd-real',
+            id: 'fb-hd',
             label: '1080p Full HD',
             quality: '1080p',
             format: 'mp4',
@@ -251,7 +189,7 @@ async function extractRealFacebook(url: string): Promise<VideoInfo | null> {
         }
         if (sdMatch) {
           qualities.push({
-            id: 'fb-sd-real',
+            id: 'fb-sd',
             label: '720p HD',
             quality: '720p',
             format: 'mp4',
@@ -280,9 +218,9 @@ async function extractRealFacebook(url: string): Promise<VideoInfo | null> {
 }
 
 // ---------------------------------------------------------------------------
-// REAL INSTAGRAM EXTRACTOR
+// INSTAGRAM EXTRACTOR
 // ---------------------------------------------------------------------------
-async function extractRealInstagram(url: string): Promise<VideoInfo | null> {
+async function extractInstagramLive(url: string): Promise<VideoInfo | null> {
   try {
     const res = await fetch(url, {
       headers: {
@@ -309,7 +247,7 @@ async function extractRealInstagram(url: string): Promise<VideoInfo | null> {
           originalUrl: url,
           qualities: [
             {
-              id: 'ig-1080p-real',
+              id: 'ig-1080p',
               label: '1080p Full HD Reel',
               quality: '1080p',
               format: 'mp4',
@@ -318,7 +256,7 @@ async function extractRealInstagram(url: string): Promise<VideoInfo | null> {
               resolution: '1080x1920',
             },
             {
-              id: 'ig-mp3-real',
+              id: 'ig-mp3',
               label: 'Audio Stream (MP3)',
               quality: 'audio',
               format: 'mp3',
@@ -392,7 +330,7 @@ async function extractCobalt(url: string, platform: 'youtube' | 'facebook' | 'in
         }
       }
     } catch {
-      // Try next
+      // Ignore
     }
   }
 
@@ -400,7 +338,7 @@ async function extractCobalt(url: string, platform: 'youtube' | 'facebook' | 'in
 }
 
 // ---------------------------------------------------------------------------
-// UTILITY CALCULATORS & PARSERS
+// UTILITY FUNCTIONS
 // ---------------------------------------------------------------------------
 function calculateBitrateSize(qualityStr: string, durationSec: number): string {
   if (durationSec <= 0) return 'Variable MB';
@@ -417,19 +355,13 @@ function calculateBitrateSize(qualityStr: string, durationSec: number): string {
   return `${totalMB.toFixed(1)} MB`;
 }
 
-function deduplicateQualities(qualities: VideoQuality[]): VideoQuality[] {
-  const seen = new Set<string>();
-  return qualities.filter(q => {
-    const key = `${q.quality}-${q.format}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function extractYouTubeId(url: string): string | null {
-  const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/);
-  return match ? match[1] : null;
+function getResolutionDimensions(qualityStr: string): string {
+  if (qualityStr.includes('2160') || qualityStr.includes('4K')) return '3840x2160';
+  if (qualityStr.includes('1080')) return '1920x1080';
+  if (qualityStr.includes('720')) return '1280x720';
+  if (qualityStr.includes('480')) return '854x480';
+  if (qualityStr.includes('360')) return '640x360';
+  return '1280x720';
 }
 
 function cleanEscapedUrl(urlStr: string): string {

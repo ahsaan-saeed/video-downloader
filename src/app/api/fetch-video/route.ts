@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import ytdl from '@distube/ytdl-core';
 import { detectPlatform, isValidUrl } from '@/lib/validators';
 import { VideoInfo, VideoQuality } from '@/lib/types';
+
+// We intentionally avoid @distube/ytdl-core on Vercel because YouTube's
+// decipher function changes daily and breaks all self-hosted extractors.
+// Instead we use multiple public API tiers with automatic fallback.
 
 export async function POST(req: NextRequest) {
   try {
@@ -9,451 +12,452 @@ export async function POST(req: NextRequest) {
     const { url } = body;
 
     if (!url || !isValidUrl(url)) {
-      return NextResponse.json(
-        { error: 'Please enter a valid video URL.' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Please enter a valid video URL.' }, { status: 400 });
     }
 
     const platform = detectPlatform(url);
     if (!platform) {
       return NextResponse.json(
-        { error: 'Unsupported URL. Please enter a valid YouTube, Facebook, or Instagram link.' },
+        { error: 'Unsupported URL. Please paste a YouTube, Facebook, or Instagram link.' },
         { status: 400 }
       );
     }
 
     const cleanUrl = url.trim();
 
-    // 1. YouTube Multi-Source Hybrid Engine
+    // ── Tier 1: RapidAPI (if user configured their key) ────────────────────
+    const rapidKey = process.env.RAPIDAPI_KEY;
+    if (rapidKey) {
+      const result = await fetchViaRapidApi(cleanUrl, platform, rapidKey);
+      if (result) return NextResponse.json(result);
+    }
+
+    // ── Tier 2: Platform-specific public free API ──────────────────────────
     if (platform === 'youtube') {
-      const ytResult = await extractYouTubeHybrid(cleanUrl);
-      if (ytResult && ytResult.qualities.length > 0) {
-        return NextResponse.json(ytResult);
-      }
+      const result = await fetchYouTubeViaY2Mate(cleanUrl);
+      if (result) return NextResponse.json(result);
+
+      const result2 = await fetchYouTubeViaNoembed(cleanUrl);
+      if (result2) return NextResponse.json(result2);
     }
 
-    // 2. Facebook Direct Scraper
     if (platform === 'facebook') {
-      const fbResult = await extractFacebookDirect(cleanUrl);
-      if (fbResult && fbResult.qualities.length > 0) {
-        return NextResponse.json(fbResult);
-      }
+      const result = await fetchFacebookViaHtml(cleanUrl);
+      if (result) return NextResponse.json(result);
     }
 
-    // 3. Instagram Direct Scraper
     if (platform === 'instagram') {
-      const igResult = await extractInstagramDirect(cleanUrl);
-      if (igResult && igResult.qualities.length > 0) {
-        return NextResponse.json(igResult);
-      }
+      const result = await fetchInstagramViaHtml(cleanUrl);
+      if (result) return NextResponse.json(result);
     }
 
-    // 4. Backup Cobalt Instance Engine
-    const cobaltResult = await extractCobalt(cleanUrl, platform);
-    if (cobaltResult && cobaltResult.qualities.length > 0) {
-      return NextResponse.json(cobaltResult);
-    }
+    // ── Tier 3: Cobalt public instance ─────────────────────────────────────
+    const cobalt = await fetchViaCobalt(cleanUrl, platform);
+    if (cobalt) return NextResponse.json(cobalt);
 
+    // ── All tiers exhausted ────────────────────────────────────────────────
     return NextResponse.json(
-      { error: `Unable to extract download links for this ${platform} video. Please check that the post is public.` },
+      {
+        error:
+          'Could not fetch download links automatically. ' +
+          'To enable full downloads, add a RAPIDAPI_KEY in your Vercel environment variables. ' +
+          'Get a free key at rapidapi.com and subscribe to "All Video Downloader" API.',
+      },
       { status: 422 }
     );
-
-  } catch (error) {
-    console.error('Fetch video API error:', error);
-    return NextResponse.json(
-      { error: 'Failed to process video URL. Please try again.' },
-      { status: 500 }
-    );
+  } catch (err) {
+    console.error('API error:', err);
+    return NextResponse.json({ error: 'Server error. Please try again.' }, { status: 500 });
   }
 }
 
-// ---------------------------------------------------------------------------
-// HYBRID YOUTUBE EXTRACTOR (ytdl-core metadata + Piped/Invidious stream links)
-// ---------------------------------------------------------------------------
-async function extractYouTubeHybrid(url: string): Promise<VideoInfo | null> {
-  const videoId = extractYouTubeId(url);
-  if (!videoId) return null;
-
-  let title = 'YouTube Video';
-  let author = 'YouTube Creator';
-  let durationSec = 0;
-  let thumbnail = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
-  const qualities: VideoQuality[] = [];
-
-  // Step A: Extract Metadata using @distube/ytdl-core
-  try {
-    if (ytdl.validateURL(url)) {
-      const info = await ytdl.getInfo(url);
-      if (info && info.videoDetails) {
-        title = info.videoDetails.title || title;
-        author = info.videoDetails.author?.name || author;
-        durationSec = parseInt(info.videoDetails.lengthSeconds || '0', 10);
-        const thumbs = info.videoDetails.thumbnails || [];
-        if (thumbs.length > 0) thumbnail = thumbs[thumbs.length - 1].url;
-
-        // Collect any direct formats ytdl-core decrypted
-        (info.formats || []).forEach((fmt, idx) => {
-          if (fmt.url && (fmt.hasVideo || fmt.hasAudio)) {
-            const qual = fmt.qualityLabel || (fmt.height ? `${fmt.height}p` : '360p');
-            qualities.push({
-              id: `ytdl-${idx}`,
-              label: `${qual} HD`,
-              quality: qual,
-              format: (fmt.container || 'mp4').toLowerCase(),
-              downloadUrl: fmt.url,
-              fileSize: calculateBitrateSize(qual, durationSec),
-              resolution: fmt.width && fmt.height ? `${fmt.width}x${fmt.height}` : getResolutionDimensions(qual),
-            });
-          }
-        });
-      }
-    }
-  } catch {
-    // If ytdl-core throws decipher warning, fallback to oEmbed + Piped
-  }
-
-  // Step B: Query Piped API Nodes for 1080p, 720p, 480p, and MP3 streams
-  const pipedEndpoints = [
-    `https://pipedapi.kavin.rocks/streams/${videoId}`,
-    `https://pipedapi.respecialized.com/streams/${videoId}`,
-    `https://pipedapi.tokhmi.xyz/streams/${videoId}`,
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 1 – RAPIDAPI  (universal, works for YT + FB + IG)
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchViaRapidApi(
+  url: string,
+  platform: 'youtube' | 'facebook' | 'instagram',
+  apiKey: string
+): Promise<VideoInfo | null> {
+  const hosts = [
+    { host: 'social-download-all-in-one.p.rapidapi.com', path: '/v1/social/autolink' },
+    { host: 'all-video-downloader-ap.p.rapidapi.com',    path: '/download'            },
   ];
 
-  for (const ep of pipedEndpoints) {
+  for (const { host, path } of hosts) {
     try {
-      const res = await fetch(ep, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(4000),
+      const res = await fetch(`https://${host}${path}`, {
+        method: 'POST',
+        headers: {
+          'x-rapidapi-key': apiKey,
+          'x-rapidapi-host': host,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url }),
+        signal: AbortSignal.timeout(8000),
       });
 
       if (res.ok) {
         const data = await res.json();
-        if (data) {
-          title = data.title || title;
-          author = data.uploader || author;
-          if (data.duration > 0) durationSec = data.duration;
-          if (data.thumbnailUrl) thumbnail = data.thumbnailUrl;
+        const mapped = mapRapidApiResponse(data, url, platform);
+        if (mapped) return mapped;
+      }
+    } catch {
+      // try next host
+    }
+  }
+  return null;
+}
 
-          // Process Video Streams
-          if (Array.isArray(data.videoStreams)) {
-            data.videoStreams.forEach((stream: any, idx: number) => {
-              if (stream.url) {
-                const resLabel = stream.quality || `${stream.height || 720}p`;
-                qualities.push({
-                  id: `piped-${idx}`,
-                  label: `${resLabel} (${stream.format || 'MP4'})`,
-                  quality: resLabel,
-                  format: (stream.format || 'mp4').toLowerCase(),
-                  downloadUrl: stream.url,
-                  fileSize: calculateBitrateSize(resLabel, durationSec),
-                  resolution: `${stream.width || 1280}x${stream.height || 720}`,
-                });
-              }
-            });
-          }
+function mapRapidApiResponse(
+  data: any,
+  url: string,
+  platform: 'youtube' | 'facebook' | 'instagram'
+): VideoInfo | null {
+  const title = data.title || data.text || `${platform} Video`;
+  const thumbnail = data.thumbnail || data.picture || data.image || '';
+  const author = data.author?.name || data.uploader || `${platform} Creator`;
+  const duration = data.duration || '';
+  const medias: any[] = data.medias || data.picker || data.links || [];
 
-          // Process Audio Stream (MP3)
-          if (Array.isArray(data.audioStreams) && data.audioStreams.length > 0) {
-            const audio = data.audioStreams[0];
-            qualities.push({
-              id: 'piped-audio-mp3',
-              label: 'Audio Only (MP3)',
-              quality: 'audio',
-              format: 'mp3',
-              downloadUrl: audio.url,
-              fileSize: calculateBitrateSize('audio', durationSec),
-              isAudioOnly: true,
-            });
-          }
+  const qualities: VideoQuality[] = medias
+    .filter((m: any) => m.url || m.link)
+    .map((m: any, idx: number) => {
+      const dlUrl = m.url || m.link;
+      const qual = m.quality || m.subname || m.resolution || `${720 - idx * 120}p`;
+      return {
+        id: `rapid-${idx}`,
+        label: qual,
+        quality: qual,
+        format: (m.extension || m.ext || 'mp4').toLowerCase(),
+        downloadUrl: dlUrl,
+        fileSize: m.formattedSize || m.size || '',
+        isAudioOnly: m.audio === true || (m.extension || '').toLowerCase() === 'mp3',
+      };
+    });
 
-          break; // Stop at first successful piped node
+  if (!qualities.length) return null;
+
+  return { title, thumbnail, duration, author, platform, originalUrl: url, qualities };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 2a – Y2Mate API  (YouTube-only, no key needed)
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchYouTubeViaY2Mate(url: string): Promise<VideoInfo | null> {
+  try {
+    // Step 1 – Analyse
+    const analyseRes = await fetch('https://www.y2mate.com/mates/analyzeV2/ajax', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': 'https://www.y2mate.com/',
+      },
+      body: new URLSearchParams({ k_query: url, k_page: 'home', hl: 'en', q_auto: '0' }).toString(),
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!analyseRes.ok) return null;
+    const analyseData = await analyseRes.json();
+    if (!analyseData || analyseData.status !== 'ok') return null;
+
+    const title: string = analyseData.title || 'YouTube Video';
+    const thumbnail: string = analyseData.thumbnail || '';
+    const durationStr: string = analyseData.duration || '00:00';
+
+    // Convert mm:ss to HH:MM:SS string
+    const duration = durationStr;
+
+    const qualities: VideoQuality[] = [];
+
+    // video links
+    const videoLinks = analyseData.links?.mp4 || {};
+    for (const [quality, info] of Object.entries(videoLinks as Record<string, any>)) {
+      if (info?.k) {
+        const dlUrl = buildY2MateDownloadUrl(info.k);
+        if (dlUrl) {
+          qualities.push({
+            id: `y2mate-${quality}`,
+            label: `${quality} (MP4)`,
+            quality,
+            format: 'mp4',
+            downloadUrl: dlUrl,
+            fileSize: info.size || '',
+          });
         }
       }
-    } catch {
-      // Try next node
     }
-  }
 
-  // Step C: Fallback to YouTube oEmbed if title still default
-  if (title === 'YouTube Video') {
-    try {
-      const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-      if (oembedRes.ok) {
-        const data = await oembedRes.json();
-        title = data.title || title;
-        author = data.author_name || author;
-        thumbnail = data.thumbnail_url || thumbnail;
+    // audio links
+    const audioLinks = analyseData.links?.mp3 || {};
+    for (const [quality, info] of Object.entries(audioLinks as Record<string, any>)) {
+      if (info?.k) {
+        const dlUrl = buildY2MateDownloadUrl(info.k);
+        if (dlUrl) {
+          qualities.push({
+            id: `y2mate-audio-${quality}`,
+            label: `Audio ${quality} (MP3)`,
+            quality: 'audio',
+            format: 'mp3',
+            downloadUrl: dlUrl,
+            fileSize: info.size || '',
+            isAudioOnly: true,
+          });
+        }
       }
-    } catch {
-      // Ignore
     }
-  }
 
-  const duration = formatSeconds(durationSec);
+    if (!qualities.length) return null;
 
-  if (qualities.length > 0) {
     return {
       title,
       thumbnail,
       duration,
-      author,
+      author: 'YouTube Channel',
       platform: 'youtube',
       originalUrl: url,
-      qualities: deduplicateQualities(qualities),
+      qualities,
     };
-  }
-
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// FACEBOOK DIRECT EXTRACTOR
-// ---------------------------------------------------------------------------
-async function extractFacebookDirect(url: string): Promise<VideoInfo | null> {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (res.ok) {
-      const html = await res.text();
-      const hdMatch = html.match(/"browser_native_hd_url":"([^"]+)"/i) || html.match(/hd_src:"([^"]+)"/i);
-      const sdMatch = html.match(/"browser_native_sd_url":"([^"]+)"/i) || html.match(/sd_src:"([^"]+)"/i) || html.match(/<meta property="og:video" content="([^"]+)"/i);
-
-      if (hdMatch || sdMatch) {
-        const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
-        const thumbMatch = html.match(/<meta property="og:image" content="([^"]+)"/i);
-
-        const qualities: VideoQuality[] = [];
-        if (hdMatch) {
-          qualities.push({
-            id: 'fb-hd',
-            label: '1080p Full HD',
-            quality: '1080p',
-            format: 'mp4',
-            downloadUrl: cleanEscapedUrl(hdMatch[1]),
-            fileSize: '42.5 MB',
-            resolution: '1920x1080',
-          });
-        }
-        if (sdMatch) {
-          qualities.push({
-            id: 'fb-sd',
-            label: '720p HD',
-            quality: '720p',
-            format: 'mp4',
-            downloadUrl: cleanEscapedUrl(sdMatch[1]),
-            fileSize: '21.2 MB',
-            resolution: '1280x720',
-          });
-        }
-
-        return {
-          title: titleMatch ? decodeHtmlEntities(titleMatch[1]) : 'Facebook Video',
-          thumbnail: thumbMatch ? decodeHtmlEntities(thumbMatch[1]) : 'https://images.unsplash.com/photo-1563986768609-322da13575f3?q=80&w=800&auto=format&fit=crop',
-          duration: 'FB Reel',
-          author: 'Facebook Creator',
-          platform: 'facebook',
-          originalUrl: url,
-          qualities,
-        };
-      }
-    }
   } catch {
-    // Ignore
+    return null;
   }
-
-  return null;
 }
 
-// ---------------------------------------------------------------------------
-// INSTAGRAM DIRECT EXTRACTOR
-// ---------------------------------------------------------------------------
-async function extractInstagramDirect(url: string): Promise<VideoInfo | null> {
+function buildY2MateDownloadUrl(k: string): string {
+  // Y2Mate returns a direct key — build the convert URL
+  return `https://www.y2mate.com/mates/convertV2/index?k=${k}`;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 2b – YouTube oEmbed + Piped (fallback for title/thumbnail + streams)
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchYouTubeViaNoembed(url: string): Promise<VideoInfo | null> {
+  const videoId = extractYouTubeId(url);
+  if (!videoId) return null;
+
+  let title = 'YouTube Video';
+  let author = 'YouTube Channel';
+  let thumbnail = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
+  let durationSec = 0;
+  const qualities: VideoQuality[] = [];
+
+  // Fetch oEmbed for metadata
   try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      },
-      signal: AbortSignal.timeout(5000),
-    });
-
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+      { signal: AbortSignal.timeout(4000) }
+    );
     if (res.ok) {
-      const html = await res.text();
-      const videoMatch = html.match(/<meta property="og:video" content="([^"]+)"/i) || html.match(/"video_url":"([^"]+)"/i);
-
-      if (videoMatch) {
-        const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
-        const thumbMatch = html.match(/<meta property="og:image" content="([^"]+)"/i);
-        const videoUrl = cleanEscapedUrl(videoMatch[1]);
-
-        return {
-          title: titleMatch ? decodeHtmlEntities(titleMatch[1]) : 'Instagram Reel',
-          thumbnail: thumbMatch ? decodeHtmlEntities(thumbMatch[1]) : 'https://images.unsplash.com/photo-1611262588024-d12430b98920?q=80&w=800&auto=format&fit=crop',
-          duration: 'IG Reel',
-          author: '@instagram',
-          platform: 'instagram',
-          originalUrl: url,
-          qualities: [
-            {
-              id: 'ig-1080p',
-              label: '1080p Full HD Reel',
-              quality: '1080p',
-              format: 'mp4',
-              downloadUrl: videoUrl,
-              fileSize: '32.4 MB',
-              resolution: '1080x1920',
-            },
-            {
-              id: 'ig-mp3',
-              label: 'Audio Stream (MP3)',
-              quality: 'audio',
-              format: 'mp3',
-              downloadUrl: videoUrl,
-              fileSize: '3.8 MB',
-              isAudioOnly: true,
-            },
-          ],
-        };
-      }
+      const d = await res.json();
+      title = d.title || title;
+      author = d.author_name || author;
+      thumbnail = d.thumbnail_url || thumbnail;
     }
-  } catch {
-    // Ignore
-  }
+  } catch {/* ignore */}
 
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// BACKUP COBALT EXTRACTOR
-// ---------------------------------------------------------------------------
-async function extractCobalt(url: string, platform: 'youtube' | 'facebook' | 'instagram'): Promise<VideoInfo | null> {
-  const endpoints = [
-    'https://api.cobalt.tools/api/json',
-    'https://cobalt.api.sc7.io/api/json',
+  // Fetch Piped streams
+  const pipedNodes = [
+    `https://pipedapi.kavin.rocks/streams/${videoId}`,
+    `https://piped-api.garudalinux.org/streams/${videoId}`,
+    `https://pipedapi.tokhmi.xyz/streams/${videoId}`,
   ];
 
-  for (const ep of endpoints) {
+  for (const node of pipedNodes) {
+    try {
+      const res = await fetch(node, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d?.title) {
+          title = d.title;
+          author = d.uploader || author;
+          durationSec = d.duration || 0;
+          thumbnail = d.thumbnailUrl || thumbnail;
+        }
+        (d?.videoStreams || []).forEach((s: any, i: number) => {
+          if (s.url && s.quality) {
+            qualities.push({
+              id: `piped-v-${i}`,
+              label: `${s.quality} (${s.format || 'MP4'})`,
+              quality: s.quality,
+              format: (s.format || 'mp4').toLowerCase(),
+              downloadUrl: s.url,
+              fileSize: calculateSize(s.quality, durationSec),
+              resolution: `${s.width || ''}x${s.height || ''}`,
+            });
+          }
+        });
+        const audio = (d?.audioStreams || [])[0];
+        if (audio?.url) {
+          qualities.push({
+            id: 'piped-audio',
+            label: 'Audio Only (MP3)',
+            quality: 'audio',
+            format: 'mp3',
+            downloadUrl: audio.url,
+            fileSize: calculateSize('audio', durationSec),
+            isAudioOnly: true,
+          });
+        }
+        if (qualities.length) break;
+      }
+    } catch {/* next */}
+  }
+
+  if (!qualities.length) return null;
+
+  return {
+    title,
+    thumbnail,
+    duration: formatSeconds(durationSec),
+    author,
+    platform: 'youtube',
+    originalUrl: url,
+    qualities: dedup(qualities),
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 2c – Facebook HTML scraper
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchFacebookViaHtml(url: string): Promise<VideoInfo | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120' },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    const hd = (html.match(/"browser_native_hd_url":"([^"]+)"/i) || html.match(/hd_src:"([^"]+)"/i))?.[1];
+    const sd = (html.match(/"browser_native_sd_url":"([^"]+)"/i) || html.match(/sd_src:"([^"]+)"/i) || html.match(/<meta property="og:video" content="([^"]+)"/i))?.[1];
+
+    if (!hd && !sd) return null;
+
+    const title = (html.match(/<meta property="og:title" content="([^"]+)"/i))?.[1];
+    const thumb = (html.match(/<meta property="og:image" content="([^"]+)"/i))?.[1];
+    const qualities: VideoQuality[] = [];
+
+    if (hd) qualities.push({ id: 'fb-hd', label: '1080p Full HD', quality: '1080p', format: 'mp4', downloadUrl: cleanUrl(hd), fileSize: '~48 MB', resolution: '1920x1080' });
+    if (sd) qualities.push({ id: 'fb-sd', label: '720p HD', quality: '720p', format: 'mp4', downloadUrl: cleanUrl(sd), fileSize: '~22 MB', resolution: '1280x720' });
+
+    return {
+      title: title ? decode(title) : 'Facebook Video',
+      thumbnail: thumb ? decode(thumb) : '',
+      duration: '',
+      author: 'Facebook Creator',
+      platform: 'facebook',
+      originalUrl: url,
+      qualities,
+    };
+  } catch { return null; }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 2d – Instagram HTML scraper
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchInstagramViaHtml(url: string): Promise<VideoInfo | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120' },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    const videoUrl = (html.match(/<meta property="og:video" content="([^"]+)"/i) || html.match(/"video_url":"([^"]+)"/i))?.[1];
+    if (!videoUrl) return null;
+
+    const title = (html.match(/<meta property="og:title" content="([^"]+)"/i))?.[1];
+    const thumb = (html.match(/<meta property="og:image" content="([^"]+)"/i))?.[1];
+
+    return {
+      title: title ? decode(title) : 'Instagram Reel',
+      thumbnail: thumb ? decode(thumb) : '',
+      duration: '',
+      author: '@instagram',
+      platform: 'instagram',
+      originalUrl: url,
+      qualities: [
+        { id: 'ig-hd', label: '1080p Full HD Reel', quality: '1080p', format: 'mp4', downloadUrl: cleanUrl(videoUrl), fileSize: '~35 MB', resolution: '1080x1920' },
+        { id: 'ig-mp3', label: 'Audio Only (MP3)', quality: 'audio', format: 'mp3', downloadUrl: cleanUrl(videoUrl), fileSize: '~4 MB', isAudioOnly: true },
+      ],
+    };
+  } catch { return null; }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 3 – Cobalt
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchViaCobalt(
+  url: string,
+  platform: 'youtube' | 'facebook' | 'instagram'
+): Promise<VideoInfo | null> {
+  for (const ep of ['https://api.cobalt.tools/api/json', 'https://cobalt.api.sc7.io/api/json']) {
     try {
       const res = await fetch(ep, {
         method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        },
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
         body: JSON.stringify({ url, vQuality: '1080' }),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(6000),
       });
-
       if (res.ok) {
-        const data = await res.json();
-        if (data && data.url) {
+        const d = await res.json();
+        if (d?.url) {
           return {
-            title: data.filename || `${platform.toUpperCase()} Video`,
-            thumbnail: 'https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=800&auto=format&fit=crop',
-            duration: 'Original',
+            title: d.filename || `${platform} Video`,
+            thumbnail: '',
+            duration: '',
             author: `${platform} Creator`,
             platform,
             originalUrl: url,
             qualities: [
-              {
-                id: 'cobalt-1080',
-                label: '1080p Full HD Stream',
-                quality: '1080p',
-                format: 'mp4',
-                downloadUrl: data.url,
-                fileSize: 'Original HD',
-              },
-              {
-                id: 'cobalt-mp3',
-                label: 'Audio Only (MP3)',
-                quality: 'audio',
-                format: 'mp3',
-                downloadUrl: data.url,
-                fileSize: 'Audio Stream',
-                isAudioOnly: true,
-              },
+              { id: 'cobalt-hd', label: '1080p Full HD', quality: '1080p', format: 'mp4', downloadUrl: d.url, fileSize: 'Direct CDN' },
+              { id: 'cobalt-audio', label: 'Audio Only (MP3)', quality: 'audio', format: 'mp3', downloadUrl: d.url, fileSize: 'Audio Stream', isAudioOnly: true },
             ],
           };
         }
       }
-    } catch {
-      // Ignore
-    }
+    } catch {/* try next */}
   }
-
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// UTILITY HELPERS
-// ---------------------------------------------------------------------------
-function calculateBitrateSize(qualityStr: string, durationSec: number): string {
-  if (durationSec <= 0) return 'Stream MB';
-
-  let bitrateBps = 2500000;
-  if (qualityStr.includes('2160') || qualityStr.includes('4K')) bitrateBps = 12000000;
-  else if (qualityStr.includes('1080')) bitrateBps = 5500000;
-  else if (qualityStr.includes('720')) bitrateBps = 2800000;
-  else if (qualityStr.includes('480')) bitrateBps = 1400000;
-  else if (qualityStr.includes('360')) bitrateBps = 800000;
-  else if (qualityStr.includes('audio') || qualityStr.includes('mp3')) bitrateBps = 256000;
-
-  const totalBytes = (bitrateBps * durationSec) / 8;
-  const totalMB = totalBytes / (1024 * 1024);
-  return `${totalMB.toFixed(1)} MB`;
-}
-
-function deduplicateQualities(qualities: VideoQuality[]): VideoQuality[] {
-  const seen = new Set<string>();
-  return qualities.filter(q => {
-    const key = `${q.quality}-${q.format}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
+// ────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ────────────────────────────────────────────────────────────────────────────
 function extractYouTubeId(url: string): string | null {
-  const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/);
-  return match ? match[1] : null;
+  return url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/)?.[1] ?? null;
 }
 
-function getResolutionDimensions(qualityStr: string): string {
-  if (qualityStr.includes('2160') || qualityStr.includes('4K')) return '3840x2160';
-  if (qualityStr.includes('1080')) return '1920x1080';
-  if (qualityStr.includes('720')) return '1280x720';
-  if (qualityStr.includes('480')) return '854x480';
-  if (qualityStr.includes('360')) return '640x360';
-  return '1280x720';
+function cleanUrl(s: string): string {
+  return s.replace(/\\u0026/g, '&').replace(/\\/g, '').replace(/&amp;/g, '&');
 }
 
-function cleanEscapedUrl(urlStr: string): string {
-  return urlStr
-    .replace(/\\u0026/g, '&')
-    .replace(/\\\\/g, '')
-    .replace(/\\/g, '')
-    .replace(/&amp;/g, '&');
+function decode(s: string): string {
+  return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
-function decodeHtmlEntities(str: string): string {
-  return str
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+function calculateSize(q: string, sec: number): string {
+  if (sec <= 0) return '';
+  const bps = q.includes('2160') ? 12_000_000
+    : q.includes('1080') ? 5_500_000
+    : q.includes('720') ? 2_800_000
+    : q.includes('480') ? 1_400_000
+    : q.includes('audio') || q.includes('mp3') ? 256_000
+    : 800_000;
+  return `${((bps * sec) / 8 / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function formatSeconds(seconds: number): string {
-  if (seconds <= 0) return 'Live';
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+function dedup(qs: VideoQuality[]): VideoQuality[] {
+  const seen = new Set<string>();
+  return qs.filter(q => { const k = `${q.quality}-${q.format}`; return seen.has(k) ? false : (seen.add(k), true); });
+}
+
+function formatSeconds(s: number): string {
+  if (s <= 0) return '';
+  return `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`;
 }

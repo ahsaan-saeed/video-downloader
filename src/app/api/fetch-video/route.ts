@@ -14,15 +14,15 @@ export async function POST(req: NextRequest) {
     }
 
     const platform = detectPlatform(url) || 'video';
-    const cleanUrl = url.trim();
+    const cleanUrl = normalizeMediaUrl(url.trim());
 
-    // ── Tier 0: Direct Local Python yt-dlp Engine (Instant & Guaranteed) ────
+    // ── Tier 0: Direct Local Python yt-dlp Engine (Instant on Local) ────────
     const localResult = await fetchViaLocalPythonEngine(cleanUrl);
     if (localResult && localResult.qualities && localResult.qualities.length > 0) {
       return NextResponse.json(localResult);
     }
 
-    // ── Tier 1: Self-Hosted Python yt-dlp Backend (Render.com / Custom VPS) ────
+    // ── Tier 1: Self-Hosted Python yt-dlp Backend (Render.com / Custom VPS) ─
     const backendUrl = process.env.BACKEND_URL;
     if (backendUrl) {
       const selfHostedResult = await fetchViaSelfHostedBackend(cleanUrl, backendUrl);
@@ -36,19 +36,34 @@ export async function POST(req: NextRequest) {
       if (result) return NextResponse.json(result);
     }
 
-    // ── Tier 3: Facebook via Snapsave Unpacker ──────────────────────────────
-    if (platform === 'facebook') {
+    // ── Tier 3: Facebook via Snapsave Unpacker & FDown (100% on Vercel) ─────
+    if (platform === 'facebook' || cleanUrl.includes('facebook.com') || cleanUrl.includes('fb.watch')) {
       const fbResult = await fetchFacebookViaSnapsave(cleanUrl);
       if (fbResult) return NextResponse.json(fbResult);
+
+      const fdownResult = await fetchFacebookViaFdown(cleanUrl);
+      if (fdownResult) return NextResponse.json(fdownResult);
     }
 
-    // ── Tier 4: TikTok via TikWM ───────────────────────────────────────────
+    // ── Tier 4: TikTok via TikWM (100% on Vercel) ──────────────────────────
     if (platform === 'tiktok' || cleanUrl.includes('tiktok.com')) {
       const tikResult = await fetchTikTokViaTikWM(cleanUrl);
       if (tikResult) return NextResponse.json(tikResult);
     }
 
-    // ── Tier 5: Cobalt v10 Instances ───────────────────────────────────────
+    // ── Tier 5: Twitter / X via VxTwitter (100% on Vercel) ─────────────────
+    if (platform === 'twitter' || cleanUrl.includes('twitter.com') || cleanUrl.includes('x.com')) {
+      const twitResult = await fetchTwitterViaVx(cleanUrl);
+      if (twitResult) return NextResponse.json(twitResult);
+    }
+
+    // ── Tier 6: YouTube oEmbed & Invidious ─────────────────────────────────
+    if (platform === 'youtube' || cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) {
+      const ytResult = await fetchYouTubeViaInvidious(cleanUrl);
+      if (ytResult) return NextResponse.json(ytResult);
+    }
+
+    // ── Tier 7: Cobalt v10 Instances ───────────────────────────────────────
     const cobalt = await fetchViaCobalt(cleanUrl, platform);
     if (cobalt) return NextResponse.json(cobalt);
 
@@ -68,7 +83,28 @@ export async function POST(req: NextRequest) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TIER 0 – Local Python yt-dlp Engine
+// URL NORMALIZER
+// ────────────────────────────────────────────────────────────────────────────
+function normalizeMediaUrl(url: string): string {
+  let normalized = url.trim();
+
+  // Facebook normalization
+  if (normalized.includes('facebook.com') || normalized.includes('fb.watch')) {
+    normalized = normalized
+      .replace(/^https?:\/\/(?:web\.|m\.|touch\.|mobile\.)facebook\.com/i, 'https://www.facebook.com')
+      .replace(/^https?:\/\/(?:www\.)?fb\.watch\/([^\/\?]+)/i, 'https://www.facebook.com/watch/?v=$1');
+  }
+
+  // Instagram normalization
+  if (normalized.includes('instagram.com')) {
+    normalized = normalized.replace(/^https?:\/\/(?:m\.|mobile\.)instagram\.com/i, 'https://www.instagram.com');
+  }
+
+  return normalized;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 0 – Local Python yt-dlp Engine (Windows / Local Dev)
 // ────────────────────────────────────────────────────────────────────────────
 async function fetchViaLocalPythonEngine(url: string): Promise<VideoInfo | null> {
   return new Promise((resolve) => {
@@ -100,7 +136,6 @@ async function fetchViaLocalPythonEngine(url: string): Promise<VideoInfo | null>
         clearTimeout(timer);
         if (code === 0 && stdoutData) {
           try {
-            // Find json string in stdout in case of warnings before json
             const jsonStart = stdoutData.indexOf('{');
             const jsonEnd = stdoutData.lastIndexOf('}');
             if (jsonStart !== -1 && jsonEnd !== -1) {
@@ -112,7 +147,7 @@ async function fetchViaLocalPythonEngine(url: string): Promise<VideoInfo | null>
               }
             }
           } catch (e) {
-            console.warn('Failed to parse local python output:', e);
+            console.warn('Local python json parse error:', e);
           }
         }
         resolve(null);
@@ -185,7 +220,7 @@ async function fetchViaRapidApi(
         if (mapped) return mapped;
       }
     } catch {
-      // try next host
+      // try next
     }
   }
   return null;
@@ -224,6 +259,7 @@ function mapRapidApiResponse(data: any, url: string, platform: string): VideoInf
 // ────────────────────────────────────────────────────────────────────────────
 async function fetchFacebookViaSnapsave(url: string): Promise<VideoInfo | null> {
   try {
+    const normalizedUrl = normalizeMediaUrl(url);
     const res = await fetch('https://snapsave.app/action.php?lang=en', {
       method: 'POST',
       headers: {
@@ -231,7 +267,7 @@ async function fetchFacebookViaSnapsave(url: string): Promise<VideoInfo | null> 
         'Referer': 'https://snapsave.app/',
         'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: new URLSearchParams({ url }).toString(),
+      body: new URLSearchParams({ url: normalizedUrl }).toString(),
       signal: AbortSignal.timeout(8000),
     });
 
@@ -240,7 +276,6 @@ async function fetchFacebookViaSnapsave(url: string): Promise<VideoInfo | null> 
     let html = decodeSnapScript(text);
     if (!html) return null;
 
-    // Unescape quotes and slashes from JS innerHTML
     html = html.replace(/\\"/g, '"').replace(/\\\//g, '/').replace(/\\n/g, '').replace(/\\t/g, '');
 
     const qualities: VideoQuality[] = [];
@@ -266,7 +301,6 @@ async function fetchFacebookViaSnapsave(url: string): Promise<VideoInfo | null> 
       }
     }
 
-    // Direct link fallback
     if (!qualities.length) {
       const directLinks = [...html.matchAll(/href="(https:\/\/[^"]+)"/g)].map((m) => m[1]);
       if (directLinks.length > 0) {
@@ -290,6 +324,64 @@ async function fetchFacebookViaSnapsave(url: string): Promise<VideoInfo | null> 
     return {
       title: titleMatch ? titleMatch[1] : 'Facebook Video',
       thumbnail: thumbMatch ? thumbMatch[1] : '',
+      duration: '',
+      author: 'Facebook Creator',
+      platform: 'facebook',
+      originalUrl: url,
+      qualities,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchFacebookViaFdown(url: string): Promise<VideoInfo | null> {
+  try {
+    const res = await fetch('https://fdown.net/download.php', {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://fdown.net/',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ URLz: url }).toString(),
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (!res.ok) return null;
+    const html = await res.text();
+    const hdLink = html.match(/id="hdlink"[^>]*href="([^"]+)"/i)?.[1];
+    const sdLink = html.match(/id="sdlink"[^>]*href="([^"]+)"/i)?.[1];
+
+    const qualities: VideoQuality[] = [];
+    if (hdLink) {
+      qualities.push({
+        id: 'fdown-hd',
+        label: '1080p Full HD (MP4)',
+        quality: '1080p',
+        format: 'mp4',
+        downloadUrl: hdLink.replace(/&amp;/g, '&'),
+        fileSize: '~40 MB',
+        isAudioOnly: false,
+      });
+    }
+    if (sdLink) {
+      qualities.push({
+        id: 'fdown-sd',
+        label: '720p HD (MP4)',
+        quality: '720p',
+        format: 'mp4',
+        downloadUrl: sdLink.replace(/&amp;/g, '&'),
+        fileSize: '~18 MB',
+        isAudioOnly: false,
+      });
+    }
+
+    if (!qualities.length) return null;
+
+    return {
+      title: 'Facebook Video',
+      thumbnail: '',
       duration: '',
       author: 'Facebook Creator',
       platform: 'facebook',
@@ -407,7 +499,95 @@ async function fetchTikTokViaTikWM(url: string): Promise<VideoInfo | null> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TIER 5 – Cobalt
+// TIER 5 – Twitter / X via VxTwitter
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchTwitterViaVx(url: string): Promise<VideoInfo | null> {
+  try {
+    const vxUrl = url.replace(/(?:twitter\.com|x\.com)/i, 'api.vxtwitter.com');
+    const res = await fetch(vxUrl, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    const videoUrl = data?.mediaURLs?.find((u: string) => u.endsWith('.mp4') || u.includes('video.twimg.com'));
+    if (!videoUrl) return null;
+
+    return {
+      title: data.text || 'Twitter / X Video',
+      thumbnail: data.mediaURLs?.[0] || '',
+      duration: '',
+      author: `@${data.user_screen_name || 'twitter'}`,
+      platform: 'twitter' as any,
+      originalUrl: url,
+      qualities: [
+        {
+          id: 'twit-hd',
+          label: 'HD Video (MP4)',
+          quality: '1080p',
+          format: 'mp4',
+          downloadUrl: videoUrl,
+          fileSize: '',
+          isAudioOnly: false,
+        },
+      ],
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 6 – YouTube Invidious
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchYouTubeViaInvidious(url: string): Promise<VideoInfo | null> {
+  const videoId = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|shorts\/))([\w-]{11})/)?.[1];
+  if (!videoId) return null;
+
+  const instances = [
+    'https://invidious.nerdvpn.de',
+    'https://yt.artemislena.eu',
+    'https://invidious.jing.rocks',
+  ];
+
+  for (const inst of instances) {
+    try {
+      const res = await fetch(`${inst}/api/v1/videos/${videoId}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d && d.formatStreams && d.formatStreams.length > 0) {
+          const qualities: VideoQuality[] = d.formatStreams.map((s: any, idx: number) => ({
+            id: `inv-${idx}`,
+            label: `${s.quality || '720p'} (${(s.container || 'mp4').toUpperCase()})`,
+            quality: s.quality || '720p',
+            format: (s.container || 'mp4').toLowerCase(),
+            downloadUrl: s.url,
+            fileSize: s.size || '',
+            resolution: s.resolution || '',
+            isAudioOnly: false,
+          }));
+
+          return {
+            title: d.title || 'YouTube Video',
+            thumbnail: d.videoThumbnails?.[0]?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+            duration: `${Math.floor((d.lengthSeconds || 0) / 60)}:${((d.lengthSeconds || 0) % 60).toString().padStart(2, '0')}`,
+            author: d.author || 'YouTube Creator',
+            platform: 'youtube',
+            originalUrl: url,
+            qualities,
+          };
+        }
+      }
+    } catch {
+      // try next instance
+    }
+  }
+  return null;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 7 – Cobalt
 // ────────────────────────────────────────────────────────────────────────────
 async function fetchViaCobalt(url: string, platform: string): Promise<VideoInfo | null> {
   const instances = ['https://api.cobalt.tools', 'https://cobalt-api.kwiatekm.tokyo'];

@@ -1,4 +1,4 @@
-export type Platform = 'youtube' | 'facebook' | 'instagram';
+export type Platform = 'youtube' | 'facebook' | 'instagram' | 'tiktok' | 'twitter' | 'other';
 
 export interface VideoQuality {
   id: string;

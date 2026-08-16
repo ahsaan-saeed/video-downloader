@@ -71,18 +71,26 @@ def extract_video_info(req: VideoRequest):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'format': 'best',
+        'format': 'bestvideo+bestaudio/best',
         'extract_flat': False,
         'skip_download': True,
         'ignoreerrors': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0 Safari/537.36',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'web_creator', 'tv_embedded', 'mweb']
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"yt-dlp failed to extract video info: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Failed to extract video info: {str(e)}")
 
     if not info:
         raise HTTPException(status_code=422, detail="Unable to fetch video information.")
@@ -93,12 +101,16 @@ def extract_video_info(req: VideoRequest):
     duration = format_seconds(info.get("duration"))
     extractor = (info.get("extractor_key") or info.get("extractor") or "video").lower()
 
-    if "youtube" in extractor:
+    if "youtube" in extractor or "youtu.be" in url:
         platform = "youtube"
-    elif "facebook" in extractor:
+    elif "facebook" in extractor or "fb.watch" in url:
         platform = "facebook"
-    elif "instagram" in extractor:
+    elif "instagram" in extractor or "instagr" in url:
         platform = "instagram"
+    elif "tiktok" in extractor or "tiktok" in url:
+        platform = "tiktok"
+    elif "twitter" in extractor or "x.com" in url:
+        platform = "twitter"
     else:
         platform = extractor
 

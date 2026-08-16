@@ -33,12 +33,20 @@ export function useDownload() {
     let receivedLength = 0;
     const chunks: BlobPart[] = [];
 
+    const fileName = `${sanitizeFileName(videoTitle)}_${quality.quality}.${quality.format}`;
+    const proxyUrl = `/api/download?url=${encodeURIComponent(quality.downloadUrl)}&filename=${encodeURIComponent(fileName)}`;
+
     try {
-      const response = await fetch(quality.downloadUrl, {
+      let response = await fetch(proxyUrl, {
         signal: abortControllerRef.current.signal,
       });
 
-      const fileName = `${sanitizeFileName(videoTitle)}_${quality.quality}.${quality.format}`;
+      if (!response.ok) {
+        // Fallback to direct URL if proxy returned non-200
+        response = await fetch(quality.downloadUrl, {
+          signal: abortControllerRef.current.signal,
+        });
+      }
 
       if (!response.ok) {
         await saveFileWithNativePickerOrLink(null, quality.downloadUrl, fileName, quality);

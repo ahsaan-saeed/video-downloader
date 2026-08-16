@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { spawn } from 'child_process';
+import path from 'path';
 import { detectPlatform, isValidUrl } from '@/lib/validators';
 import { VideoInfo, VideoQuality } from '@/lib/types';
 
@@ -11,50 +13,42 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Please enter a valid video URL.' }, { status: 400 });
     }
 
-    const platform = detectPlatform(url);
-    if (!platform) {
-      return NextResponse.json(
-        { error: 'Unsupported URL. Please paste a YouTube, Facebook, or Instagram link.' },
-        { status: 400 }
-      );
-    }
-
+    const platform = detectPlatform(url) || 'video';
     const cleanUrl = url.trim();
 
-    // ── Tier 0: Self-Hosted Python yt-dlp Backend (Render.com / Custom VPS) ────
+    // ── Tier 0: Direct Local Python yt-dlp Engine (Instant & Guaranteed) ────
+    const localResult = await fetchViaLocalPythonEngine(cleanUrl);
+    if (localResult && localResult.qualities && localResult.qualities.length > 0) {
+      return NextResponse.json(localResult);
+    }
+
+    // ── Tier 1: Self-Hosted Python yt-dlp Backend (Render.com / Custom VPS) ────
     const backendUrl = process.env.BACKEND_URL;
     if (backendUrl) {
       const selfHostedResult = await fetchViaSelfHostedBackend(cleanUrl, backendUrl);
       if (selfHostedResult) return NextResponse.json(selfHostedResult);
     }
 
-    // ── Tier 1: RapidAPI (if user configured their key) ────────────────────
+    // ── Tier 2: RapidAPI (if configured) ───────────────────────────────────
     const rapidKey = process.env.RAPIDAPI_KEY;
     if (rapidKey) {
-      const result = await fetchViaRapidApi(cleanUrl, platform, rapidKey);
+      const result = await fetchViaRapidApi(cleanUrl, platform as any, rapidKey);
       if (result) return NextResponse.json(result);
     }
 
-    // ── Tier 2: Platform-specific public free API ──────────────────────────
-    if (platform === 'youtube') {
-      const result = await fetchYouTubeViaY2Mate(cleanUrl);
-      if (result) return NextResponse.json(result);
-
-      const result2 = await fetchYouTubeViaNoembed(cleanUrl);
-      if (result2) return NextResponse.json(result2);
-    }
-
+    // ── Tier 3: Facebook via Snapsave Unpacker ──────────────────────────────
     if (platform === 'facebook') {
-      const result = await fetchFacebookViaHtml(cleanUrl);
-      if (result) return NextResponse.json(result);
+      const fbResult = await fetchFacebookViaSnapsave(cleanUrl);
+      if (fbResult) return NextResponse.json(fbResult);
     }
 
-    if (platform === 'instagram') {
-      const result = await fetchInstagramViaHtml(cleanUrl);
-      if (result) return NextResponse.json(result);
+    // ── Tier 4: TikTok via TikWM ───────────────────────────────────────────
+    if (platform === 'tiktok' || cleanUrl.includes('tiktok.com')) {
+      const tikResult = await fetchTikTokViaTikWM(cleanUrl);
+      if (tikResult) return NextResponse.json(tikResult);
     }
 
-    // ── Tier 3: Cobalt public instance ─────────────────────────────────────
+    // ── Tier 5: Cobalt v10 Instances ───────────────────────────────────────
     const cobalt = await fetchViaCobalt(cleanUrl, platform);
     if (cobalt) return NextResponse.json(cobalt);
 
@@ -62,19 +56,80 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       {
         error:
-          'Could not fetch download links automatically. ' +
-          'To enable guaranteed 100% video downloads, deploy the backend service on Render.com and set the BACKEND_URL environment variable in Vercel.',
+          'Could not fetch video download links. ' +
+          'Please ensure the link is public and accessible, or try another video URL.',
       },
       { status: 422 }
     );
-  } catch (err) {
+  } catch (err: any) {
     console.error('API error:', err);
-    return NextResponse.json({ error: 'Server error. Please try again.' }, { status: 500 });
+    return NextResponse.json({ error: err.message || 'Server error. Please try again.' }, { status: 500 });
   }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TIER 0 – Self-Hosted Python yt-dlp Backend
+// TIER 0 – Local Python yt-dlp Engine
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchViaLocalPythonEngine(url: string): Promise<VideoInfo | null> {
+  return new Promise((resolve) => {
+    try {
+      const scriptPath = path.join(process.cwd(), 'backend', 'extractor.py');
+      const pyProcess = spawn('python', [scriptPath, url], {
+        windowsHide: true,
+      });
+
+      let stdoutData = '';
+      let stderrData = '';
+
+      pyProcess.stdout.on('data', (data) => {
+        stdoutData += data.toString();
+      });
+
+      pyProcess.stderr.on('data', (data) => {
+        stderrData += data.toString();
+      });
+
+      const timer = setTimeout(() => {
+        try {
+          pyProcess.kill();
+        } catch {}
+        resolve(null);
+      }, 15000);
+
+      pyProcess.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0 && stdoutData) {
+          try {
+            // Find json string in stdout in case of warnings before json
+            const jsonStart = stdoutData.indexOf('{');
+            const jsonEnd = stdoutData.lastIndexOf('}');
+            if (jsonStart !== -1 && jsonEnd !== -1) {
+              const jsonStr = stdoutData.substring(jsonStart, jsonEnd + 1);
+              const data = JSON.parse(jsonStr);
+              if (data && data.qualities && data.qualities.length > 0) {
+                resolve(data as VideoInfo);
+                return;
+              }
+            }
+          } catch (e) {
+            console.warn('Failed to parse local python output:', e);
+          }
+        }
+        resolve(null);
+      });
+
+      pyProcess.on('error', () => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 1 – Self-Hosted Python yt-dlp Backend (Render / VPS)
 // ────────────────────────────────────────────────────────────────────────────
 async function fetchViaSelfHostedBackend(url: string, backendUrl: string): Promise<VideoInfo | null> {
   try {
@@ -83,7 +138,7 @@ async function fetchViaSelfHostedBackend(url: string, backendUrl: string): Promi
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
-      signal: AbortSignal.timeout(15000), // Render free tier can take up to 15s if waking up
+      signal: AbortSignal.timeout(15000),
     });
 
     if (res.ok) {
@@ -93,27 +148,27 @@ async function fetchViaSelfHostedBackend(url: string, backendUrl: string): Promi
       }
     }
   } catch (err) {
-    console.warn('Self-hosted backend call failed, falling back to public APIs:', err);
+    console.warn('Self-hosted backend call failed:', err);
   }
   return null;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TIER 1 – RAPIDAPI  (universal, works for YT + FB + IG)
+// TIER 2 – RAPIDAPI
 // ────────────────────────────────────────────────────────────────────────────
 async function fetchViaRapidApi(
   url: string,
-  platform: 'youtube' | 'facebook' | 'instagram',
+  platform: 'youtube' | 'facebook' | 'instagram' | string,
   apiKey: string
 ): Promise<VideoInfo | null> {
   const hosts = [
     { host: 'social-download-all-in-one.p.rapidapi.com', path: '/v1/social/autolink' },
-    { host: 'all-video-downloader-ap.p.rapidapi.com',    path: '/download'            },
+    { host: 'all-video-downloader-ap.p.rapidapi.com', path: '/download' },
   ];
 
-  for (const { host, path } of hosts) {
+  for (const { host, path: apiPath } of hosts) {
     try {
-      const res = await fetch(`https://${host}${path}`, {
+      const res = await fetch(`https://${host}${apiPath}`, {
         method: 'POST',
         headers: {
           'x-rapidapi-key': apiKey,
@@ -136,11 +191,7 @@ async function fetchViaRapidApi(
   return null;
 }
 
-function mapRapidApiResponse(
-  data: any,
-  url: string,
-  platform: 'youtube' | 'facebook' | 'instagram'
-): VideoInfo | null {
+function mapRapidApiResponse(data: any, url: string, platform: string): VideoInfo | null {
   const title = data.title || data.text || `${platform} Video`;
   const thumbnail = data.thumbnail || data.picture || data.image || '';
   const author = data.author?.name || data.uploader || `${platform} Creator`;
@@ -165,74 +216,188 @@ function mapRapidApiResponse(
 
   if (!qualities.length) return null;
 
-  return { title, thumbnail, duration, author, platform, originalUrl: url, qualities };
+  return { title, thumbnail, duration, author, platform: platform as any, originalUrl: url, qualities };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TIER 2a – Y2Mate API  (YouTube-only, no key needed)
+// TIER 3 – Facebook via Snapsave Unpacker
 // ────────────────────────────────────────────────────────────────────────────
-async function fetchYouTubeViaY2Mate(url: string): Promise<VideoInfo | null> {
+async function fetchFacebookViaSnapsave(url: string): Promise<VideoInfo | null> {
   try {
-    const analyseRes = await fetch('https://www.y2mate.com/mates/analyzeV2/ajax', {
+    const res = await fetch('https://snapsave.app/action.php?lang=en', {
       method: 'POST',
       headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://snapsave.app/',
         'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0',
-        'Referer': 'https://www.y2mate.com/',
       },
-      body: new URLSearchParams({ k_query: url, k_page: 'home', hl: 'en', q_auto: '0' }).toString(),
+      body: new URLSearchParams({ url }).toString(),
       signal: AbortSignal.timeout(8000),
     });
 
-    if (!analyseRes.ok) return null;
-    const analyseData = await analyseRes.json();
-    if (!analyseData || analyseData.status !== 'ok') return null;
+    if (!res.ok) return null;
+    const text = await res.text();
+    let html = decodeSnapScript(text);
+    if (!html) return null;
 
-    const title: string = analyseData.title || 'YouTube Video';
-    const thumbnail: string = analyseData.thumbnail || '';
-    const durationStr: string = analyseData.duration || '00:00';
+    // Unescape quotes and slashes from JS innerHTML
+    html = html.replace(/\\"/g, '"').replace(/\\\//g, '/').replace(/\\n/g, '').replace(/\\t/g, '');
 
     const qualities: VideoQuality[] = [];
+    const rows = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
 
-    const videoLinks = analyseData.links?.mp4 || {};
-    for (const [quality, info] of Object.entries(videoLinks as Record<string, any>)) {
-      if (info?.k) {
-        const dlUrl = `https://www.y2mate.com/mates/convertV2/index?k=${info.k}`;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i][1];
+      const qualMatch = row.match(/class="video-quality"[^>]*>([^<]+)</i);
+      const urlMatch = row.match(/href="([^"]+)"/i);
+
+      if (urlMatch && urlMatch[1] && !urlMatch[1].startsWith('#')) {
+        const qualText = qualMatch ? qualMatch[1].trim() : `${720 - i * 240}p`;
+        const cleanQual = qualText.includes('1080') ? '1080p' : qualText.includes('720') ? '720p' : '480p';
         qualities.push({
-          id: `y2mate-${quality}`,
-          label: `${quality} (MP4)`,
-          quality,
+          id: `fb-snap-${i}`,
+          label: `${qualText} (MP4)`,
+          quality: cleanQual,
           format: 'mp4',
-          downloadUrl: dlUrl,
-          fileSize: info.size || '',
+          downloadUrl: urlMatch[1],
+          fileSize: qualText.includes('HD') ? '~35 MB' : '~15 MB',
+          isAudioOnly: false,
         });
       }
     }
 
-    const audioLinks = analyseData.links?.mp3 || {};
-    for (const [quality, info] of Object.entries(audioLinks as Record<string, any>)) {
-      if (info?.k) {
-        const dlUrl = `https://www.y2mate.com/mates/convertV2/index?k=${info.k}`;
+    // Direct link fallback
+    if (!qualities.length) {
+      const directLinks = [...html.matchAll(/href="(https:\/\/[^"]+)"/g)].map((m) => m[1]);
+      if (directLinks.length > 0) {
         qualities.push({
-          id: `y2mate-audio-${quality}`,
-          label: `Audio ${quality} (MP3)`,
-          quality: 'audio',
-          format: 'mp3',
-          downloadUrl: dlUrl,
-          fileSize: info.size || '',
-          isAudioOnly: true,
+          id: 'fb-snap-0',
+          label: '720p HD (MP4)',
+          quality: '720p',
+          format: 'mp4',
+          downloadUrl: directLinks[0],
+          fileSize: '',
+          isAudioOnly: false,
         });
       }
     }
 
     if (!qualities.length) return null;
 
+    const thumbMatch = html.match(/<img[^>]+src="([^"]+)"/i);
+    const titleMatch = html.match(/<strong>([^<]+)<\/strong>/i);
+
     return {
-      title,
-      thumbnail,
-      duration: durationStr,
-      author: 'YouTube Channel',
-      platform: 'youtube',
+      title: titleMatch ? titleMatch[1] : 'Facebook Video',
+      thumbnail: thumbMatch ? thumbMatch[1] : '',
+      duration: '',
+      author: 'Facebook Creator',
+      platform: 'facebook',
+      originalUrl: url,
+      qualities,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function decodeSnapScript(script: string): string | null {
+  try {
+    const argsMatch = script.match(
+      /\}\s*\(\s*("[\s\S]*?"|'[\s\S]*?')\s*,\s*(\d+|"[\s\S]*?")\s*,\s*("[\s\S]*?"|'[\s\S]*?')\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\s*\)/
+    );
+    if (!argsMatch) return null;
+
+    const func = new Function(
+      `return (function(h,u,n,t,e,r){
+        r="";
+        for(var i=0,len=h.length;i<len;i++){
+          var s="";
+          while(h[i]!==n[e]){
+            s+=h[i];
+            i++;
+          }
+          for(var j=0;j<n.length;j++)
+            s=s.replace(new RegExp(n[j],"g"),j.toString());
+          r+=String.fromCharCode(_0xe51c(s,e,10)-t);
+        }
+        function _0xe51c(d,e,f){
+          var g="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/";
+          var h=g.slice(0,e);
+          var i=g.slice(0,f);
+          var j=d.split("").reverse().reduce(function(a,b,c){
+            if(h.indexOf(b)!==-1)return a+=h.indexOf(b)*(Math.pow(e,c));
+          },0);
+          var k="";
+          while(j>0){
+            k=i[j%f]+k;
+            j=(j-(j%f))/f;
+          }
+          return parseInt(k)||0;
+        }
+        return decodeURIComponent(escape(r));
+      })(${argsMatch[1]}, ${argsMatch[2]}, ${argsMatch[3]}, ${argsMatch[4]}, ${argsMatch[5]}, ${argsMatch[6]})`
+    );
+    return func();
+  } catch {
+    return null;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIER 4 – TikTok via TikWM
+// ────────────────────────────────────────────────────────────────────────────
+async function fetchTikTokViaTikWM(url: string): Promise<VideoInfo | null> {
+  try {
+    const res = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const data = json?.data;
+    if (!data || !data.play) return null;
+
+    const qualities: VideoQuality[] = [];
+    if (data.hdplay) {
+      qualities.push({
+        id: 'tiktok-hd',
+        label: '1080p HD (No Watermark)',
+        quality: '1080p',
+        format: 'mp4',
+        downloadUrl: data.hdplay,
+        fileSize: data.hd_size ? `${(data.hd_size / 1024 / 1024).toFixed(1)} MB` : '',
+        isAudioOnly: false,
+      });
+    }
+
+    qualities.push({
+      id: 'tiktok-sd',
+      label: '720p (No Watermark)',
+      quality: '720p',
+      format: 'mp4',
+      downloadUrl: data.play,
+      fileSize: data.size ? `${(data.size / 1024 / 1024).toFixed(1)} MB` : '',
+      isAudioOnly: false,
+    });
+
+    if (data.music) {
+      qualities.push({
+        id: 'tiktok-audio',
+        label: 'Audio Only (MP3)',
+        quality: 'audio',
+        format: 'mp3',
+        downloadUrl: data.music,
+        fileSize: '~3 MB',
+        isAudioOnly: true,
+      });
+    }
+
+    return {
+      title: data.title || 'TikTok Video',
+      thumbnail: data.cover || '',
+      duration: data.duration ? `${Math.floor(data.duration / 60)}:${(data.duration % 60).toString().padStart(2, '0')}` : '',
+      author: data.author?.nickname || data.author?.unique_id || 'TikTok Creator',
+      platform: 'tiktok' as any,
       originalUrl: url,
       qualities,
     };
@@ -242,177 +407,17 @@ async function fetchYouTubeViaY2Mate(url: string): Promise<VideoInfo | null> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// TIER 2b – YouTube oEmbed + Piped (fallback for title/thumbnail + streams)
+// TIER 5 – Cobalt
 // ────────────────────────────────────────────────────────────────────────────
-async function fetchYouTubeViaNoembed(url: string): Promise<VideoInfo | null> {
-  const videoId = extractYouTubeId(url);
-  if (!videoId) return null;
-
-  let title = 'YouTube Video';
-  let author = 'YouTube Channel';
-  let thumbnail = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
-  let durationSec = 0;
-  const qualities: VideoQuality[] = [];
-
-  try {
-    const res = await fetch(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-      { signal: AbortSignal.timeout(4000) }
-    );
-    if (res.ok) {
-      const d = await res.json();
-      title = d.title || title;
-      author = d.author_name || author;
-      thumbnail = d.thumbnail_url || thumbnail;
-    }
-  } catch {/* ignore */}
-
-  const pipedNodes = [
-    `https://pipedapi.kavin.rocks/streams/${videoId}`,
-    `https://piped-api.garudalinux.org/streams/${videoId}`,
-    `https://pipedapi.tokhmi.xyz/streams/${videoId}`,
-  ];
-
-  for (const node of pipedNodes) {
-    try {
-      const res = await fetch(node, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (res.ok) {
-        const d = await res.json();
-        if (d?.title) {
-          title = d.title;
-          author = d.uploader || author;
-          durationSec = d.duration || 0;
-          thumbnail = d.thumbnailUrl || thumbnail;
-        }
-        (d?.videoStreams || []).forEach((s: any, i: number) => {
-          if (s.url && s.quality) {
-            qualities.push({
-              id: `piped-v-${i}`,
-              label: `${s.quality} (${s.format || 'MP4'})`,
-              quality: s.quality,
-              format: (s.format || 'mp4').toLowerCase(),
-              downloadUrl: s.url,
-              fileSize: calculateSize(s.quality, durationSec),
-              resolution: `${s.width || ''}x${s.height || ''}`,
-            });
-          }
-        });
-        const audio = (d?.audioStreams || [])[0];
-        if (audio?.url) {
-          qualities.push({
-            id: 'piped-audio',
-            label: 'Audio Only (MP3)',
-            quality: 'audio',
-            format: 'mp3',
-            downloadUrl: audio.url,
-            fileSize: calculateSize('audio', durationSec),
-            isAudioOnly: true,
-          });
-        }
-        if (qualities.length) break;
-      }
-    } catch {/* next */}
-  }
-
-  if (!qualities.length) return null;
-
-  return {
-    title,
-    thumbnail,
-    duration: formatSeconds(durationSec),
-    author,
-    platform: 'youtube',
-    originalUrl: url,
-    qualities: dedup(qualities),
-  };
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TIER 2c – Facebook HTML scraper
-// ────────────────────────────────────────────────────────────────────────────
-async function fetchFacebookViaHtml(url: string): Promise<VideoInfo | null> {
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120' },
-      signal: AbortSignal.timeout(6000),
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
-
-    const hd = (html.match(/"browser_native_hd_url":"([^"]+)"/i) || html.match(/hd_src:"([^"]+)"/i))?.[1];
-    const sd = (html.match(/"browser_native_sd_url":"([^"]+)"/i) || html.match(/sd_src:"([^"]+)"/i) || html.match(/<meta property="og:video" content="([^"]+)"/i))?.[1];
-
-    if (!hd && !sd) return null;
-
-    const title = (html.match(/<meta property="og:title" content="([^"]+)"/i))?.[1];
-    const thumb = (html.match(/<meta property="og:image" content="([^"]+)"/i))?.[1];
-    const qualities: VideoQuality[] = [];
-
-    if (hd) qualities.push({ id: 'fb-hd', label: '1080p Full HD', quality: '1080p', format: 'mp4', downloadUrl: cleanUrl(hd), fileSize: '~48 MB', resolution: '1920x1080' });
-    if (sd) qualities.push({ id: 'fb-sd', label: '720p HD', quality: '720p', format: 'mp4', downloadUrl: cleanUrl(sd), fileSize: '~22 MB', resolution: '1280x720' });
-
-    return {
-      title: title ? decode(title) : 'Facebook Video',
-      thumbnail: thumb ? decode(thumb) : '',
-      duration: '',
-      author: 'Facebook Creator',
-      platform: 'facebook',
-      originalUrl: url,
-      qualities,
-    };
-  } catch { return null; }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TIER 2d – Instagram HTML scraper
-// ────────────────────────────────────────────────────────────────────────────
-async function fetchInstagramViaHtml(url: string): Promise<VideoInfo | null> {
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120' },
-      signal: AbortSignal.timeout(6000),
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
-
-    const videoUrl = (html.match(/<meta property="og:video" content="([^"]+)"/i) || html.match(/"video_url":"([^"]+)"/i))?.[1];
-    if (!videoUrl) return null;
-
-    const title = (html.match(/<meta property="og:title" content="([^"]+)"/i))?.[1];
-    const thumb = (html.match(/<meta property="og:image" content="([^"]+)"/i))?.[1];
-
-    return {
-      title: title ? decode(title) : 'Instagram Reel',
-      thumbnail: thumb ? decode(thumb) : '',
-      duration: '',
-      author: '@instagram',
-      platform: 'instagram',
-      originalUrl: url,
-      qualities: [
-        { id: 'ig-hd', label: '1080p Full HD Reel', quality: '1080p', format: 'mp4', downloadUrl: cleanUrl(videoUrl), fileSize: '~35 MB', resolution: '1080x1920' },
-        { id: 'ig-mp3', label: 'Audio Only (MP3)', quality: 'audio', format: 'mp3', downloadUrl: cleanUrl(videoUrl), fileSize: '~4 MB', isAudioOnly: true },
-      ],
-    };
-  } catch { return null; }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TIER 3 – Cobalt
-// ────────────────────────────────────────────────────────────────────────────
-async function fetchViaCobalt(
-  url: string,
-  platform: 'youtube' | 'facebook' | 'instagram'
-): Promise<VideoInfo | null> {
-  for (const ep of ['https://api.cobalt.tools/api/json', 'https://cobalt.api.sc7.io/api/json']) {
+async function fetchViaCobalt(url: string, platform: string): Promise<VideoInfo | null> {
+  const instances = ['https://api.cobalt.tools', 'https://cobalt-api.kwiatekm.tokyo'];
+  for (const ep of instances) {
     try {
       const res = await fetch(ep, {
         method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-        body: JSON.stringify({ url, vQuality: '1080' }),
-        signal: AbortSignal.timeout(6000),
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+        body: JSON.stringify({ url }),
+        signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
         const d = await res.json();
@@ -422,52 +427,24 @@ async function fetchViaCobalt(
             thumbnail: '',
             duration: '',
             author: `${platform} Creator`,
-            platform,
+            platform: platform as any,
             originalUrl: url,
             qualities: [
-              { id: 'cobalt-hd', label: '1080p Full HD', quality: '1080p', format: 'mp4', downloadUrl: d.url, fileSize: 'Direct CDN' },
-              { id: 'cobalt-audio', label: 'Audio Only (MP3)', quality: 'audio', format: 'mp3', downloadUrl: d.url, fileSize: 'Audio Stream', isAudioOnly: true },
+              {
+                id: 'cobalt-hd',
+                label: 'HD Quality (MP4)',
+                quality: '1080p',
+                format: 'mp4',
+                downloadUrl: d.url,
+                fileSize: 'Direct Stream',
+              },
             ],
           };
         }
       }
-    } catch {/* try next */}
+    } catch {
+      // try next
+    }
   }
   return null;
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ────────────────────────────────────────────────────────────────────────────
-function extractYouTubeId(url: string): string | null {
-  return url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/)?.[1] ?? null;
-}
-
-function cleanUrl(s: string): string {
-  return s.replace(/\\u0026/g, '&').replace(/\\/g, '').replace(/&amp;/g, '&');
-}
-
-function decode(s: string): string {
-  return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-}
-
-function calculateSize(q: string, sec: number): string {
-  if (sec <= 0) return '';
-  const bps = q.includes('2160') ? 12_000_000
-    : q.includes('1080') ? 5_500_000
-    : q.includes('720') ? 2_800_000
-    : q.includes('480') ? 1_400_000
-    : q.includes('audio') || q.includes('mp3') ? 256_000
-    : 800_000;
-  return `${((bps * sec) / 8 / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function dedup(qs: VideoQuality[]): VideoQuality[] {
-  const seen = new Set<string>();
-  return qs.filter(q => { const k = `${q.quality}-${q.format}`; return seen.has(k) ? false : (seen.add(k), true); });
-}
-
-function formatSeconds(s: number): string {
-  if (s <= 0) return '';
-  return `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`;
 }
